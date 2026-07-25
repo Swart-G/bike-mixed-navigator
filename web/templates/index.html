@@ -121,7 +121,10 @@
     </main>
   </div>
 
-  <script src="https://unpkg.com/maplibre-gl@6.0.0/dist/maplibre-gl.js"></script>
-  <script src="/static/app.js"></script>
+  <script type="module">
+    import * as maplibregl from "https://unpkg.com/maplibre-gl@6.0.0/dist/maplibre-gl.mjs";
+    window.maplibregl = maplibregl;
+    await import("/static/app.js");
+  </script>
 </body>
 </html>

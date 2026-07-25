@@ -228,6 +228,7 @@ async function calculateRoutes() {
         departureTime: $("departure").value,
         profile: state.profile,
         maxTransfers: Number($("max-transfers").value),
+        deepSearch: true,
       }),
     });
 
@@ -240,7 +241,14 @@ async function calculateRoutes() {
 
     if (state.routes.length) {
       selectRoute(state.routes[0].id);
-      $("results-summary").textContent = `${state.routes.length} вариантов`;
+      const stats = data.stats || {};
+      const candidates = stats.candidatesTotal ?? state.routes.length;
+      const anchors = stats.anchorCandidates ?? 0;
+      const elapsed = stats.elapsedMs ? ` · ${(stats.elapsedMs / 1000).toFixed(1)} с` : "";
+      $("results-summary").textContent = `${state.routes.length} из ${candidates} кандидатов · anchors ${anchors}${elapsed}`;
+      if (stats.deepSearchError) {
+        showDeepSearchWarning(stats.deepSearchError);
+      }
     } else {
       $("results-summary").textContent = "Маршруты не найдены";
       $("route-list").innerHTML =
@@ -255,8 +263,13 @@ async function calculateRoutes() {
 }
 
 function renderWarnings(warnings) {
+  const ignored = new Set([
+    "WALKING_BETTER_THAN_TRANSIT",
+    "NO_TRANSIT_CONNECTION",
+    "NO_TRANSIT_CONNECTION_IN_SEARCH_WINDOW",
+  ]);
   const meaningful = warnings.filter(
-    (item) => item && item.code && item.code !== "WALKING_BETTER_THAN_TRANSIT"
+    (item) => item && item.code && !ignored.has(item.code)
   );
 
   if (!meaningful.length) {
@@ -270,6 +283,13 @@ function renderWarnings(warnings) {
   $("warnings").classList.remove("hidden");
 }
 
+function showDeepSearchWarning(message) {
+  const box = $("warnings");
+  const previous = box.classList.contains("hidden") ? "" : box.innerHTML;
+  box.innerHTML = `${previous}<div><strong>Deep search:</strong> ${escapeHtml(message)}</div>`;
+  box.classList.remove("hidden");
+}
+
 function renderRoutes() {
   const list = $("route-list");
   list.innerHTML = "";
@@ -280,12 +300,8 @@ function renderRoutes() {
     card.className = "route-card";
     card.dataset.routeId = route.id;
 
-    const label =
-      route.kind === "bike"
-        ? "Только велосипед"
-        : index === 0
-          ? "Лучший вариант"
-          : "Смешанный маршрут";
+    const label = route.recommendation ||
+      (route.kind === "bike" ? "Только велосипед" : "Смешанный маршрут");
 
     const waitBadge =
       route.initialWait > 60
@@ -301,6 +317,10 @@ function renderRoutes() {
       ? `<span class="badge">${escapeHtml(transitNames.join(" · "))}</span>`
       : `<span class="badge">🚲 ${(route.bikeDistance / 1000).toFixed(1)} км</span>`;
 
+    const anchorBadge = route.anchor
+      ? `<span class="badge anchor">выход: ${escapeHtml(route.anchor.name)} → 🚲 ${(route.anchor.bikeEgressDistance / 1000).toFixed(1)} км</span>`
+      : "";
+
     card.innerHTML = `
       <div class="route-top">
         <div>
@@ -313,6 +333,7 @@ function renderRoutes() {
       <div class="route-badges">
         ${waitBadge}
         ${transitBadge}
+        ${anchorBadge}
         ${route.transfers ? `<span class="badge">${route.transfers} перес.</span>` : ""}
       </div>
 

@@ -1,43 +1,64 @@
-# Смешанный навигатор — Web prototype
+# Смешанный навигатор — Web prototype v0.2
 
-Web UI для локального OpenTripPlanner.
+Web UI + собственный слой генерации мультимодальных кандидатов поверх OpenTripPlanner.
 
-## Уже работает
+## Что нового в v0.2
 
-- карта MapLibre;
-- старт и финиш кликом по карте;
-- перетаскиваемые маркеры;
-- поиск адреса по кнопке/Enter;
-- велосипед + BUS/TRAM/TROLLEYBUS/RAIL + велосипед;
-- direct bicycle;
-- метро исключено;
-- цветная геометрия каждого участка из `legGeometry`;
-- несколько вариантов;
-- честное `initialWait`: общее время считается от момента, когда пользователь готов выехать;
-- backend-прокси к OTP.
+Маршрутизатор больше не полагается на один ответ OTP.
 
-## Вариант 1: запустить Python рядом с OTP
+### Multi-query Candidate Generator
 
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-python app.py
-```
+Один пользовательский запрос параллельно разворачивается в несколько поисков:
 
-Открыть:
+- выбранный профиль + все виды транспорта;
+- fast + все виды транспорта;
+- calm + все виды транспорта;
+- BUS/TROLLEYBUS only;
+- TRAM only;
+- RAIL only;
+- без пересадок;
+- максимум одна пересадка.
+
+Результаты объединяются и дедуплицируются.
+
+### Egress Anchor Search
+
+Backend читает `moscow-gtfs.zip` и строит в памяти индекс остановок. Для длинных поездок он выбирает до 8 перспективных точек выхода в 1–9 км от цели и проверяет отдельную стратегию:
 
 ```text
-http://localhost:5000
+origin → bicycle/transit → anchor stop → bicycle → destination
 ```
 
-По умолчанию backend обращается к:
+Это позволяет находить варианты вроде «долго на автобусе к центру, затем несколько километров по велодорожкам», которые обычный top-N OTP может не показать.
+
+### Diversity Selector
+
+Финальный список — не просто top-N по одному score. Есть квоты на:
+
+- самый быстрый;
+- лучший по score;
+- лучший egress-anchor;
+- автобус + велосипед;
+- трамвай + велосипед;
+- поезд + велосипед;
+- прямой велосипед;
+- остальные непохожие варианты.
+
+Одинаковые transit chains группируются, поэтому один и тот же трамвай не должен заполнять весь список.
+
+### Новый penalty
+
+Короткие бессмысленные посадки на транспорт штрафуются. Например:
 
 ```text
-http://localhost:8080/otp/gtfs/v1
+🚲 5.4 км → 🚌 0.3 км → 🚲 1.3 км
 ```
 
-## Вариант 2: добавить в существующий Docker Compose
+получает дополнительный penalty.
+
+## Docker Compose
+
+Web-контейнеру теперь нужен read-only доступ к тому же GTFS, который использует OTP.
 
 Рекомендуемая структура:
 
@@ -45,18 +66,19 @@ http://localhost:8080/otp/gtfs/v1
 otp-moscow/
 ├── compose.yaml
 ├── data/
+│   ├── graph.obj
+│   ├── moscow.osm.pbf
+│   └── moscow-gtfs.zip
 └── web/
     ├── app.py
+    ├── routing/
     ├── Dockerfile
     ├── requirements.txt
     ├── templates/
-    │   └── index.html
     └── static/
-        ├── app.js
-        └── style.css
 ```
 
-В `compose.yaml` добавить:
+Добавьте/замените сервис `web`:
 
 ```yaml
   web:
@@ -66,38 +88,72 @@ otp-moscow/
       - "5000:5000"
     environment:
       OTP_URL: "http://otp:8080/otp/gtfs/v1"
-      NOMINATIM_USER_AGENT: "MixedNavigatorPrototype/0.1"
+      GTFS_PATH: "/otp-data/moscow-gtfs.zip"
+      OTP_FEED_ID: "1"
+      NOMINATIM_USER_AGENT: "MixedNavigatorPrototype/0.2"
+    volumes:
+      - ./data:/otp-data:ro
     depends_on:
       - otp
     restart: unless-stopped
 ```
 
-Запуск:
+Пересборка:
 
 ```bash
-docker compose up -d --build
-docker compose logs -f web
+docker compose up -d --build web
 ```
 
-## Геокодинг
+Проверка:
 
-Публичный Nominatim используется только по явному действию пользователя:
-кнопка поиска или Enter. Autocomplete отсутствует. Backend кэширует результаты
-и выдерживает минимум 1.05 секунды между запросами.
+```bash
+curl -s http://localhost:5000/api/health | jq
+```
 
-Для production лучше заменить его на собственный geocoder или отдельного провайдера.
+Ожидается примерно:
 
-## Переменные окружения
+```json
+{
+  "ok": true,
+  "gtfsIndex": {
+    "loaded": true,
+    "stopCount": 9902,
+    "error": null
+  }
+}
+```
 
-- `OTP_URL`
-- `NOMINATIM_URL`
-- `NOMINATIM_USER_AGENT`
-- `PORT`
+## API
 
-## Ограничения прототипа
+`POST /api/routes` дополнительно возвращает `stats`:
 
-- realtime транспорта пока нет;
-- корректность bike-on-transit зависит от подготовленного GTFS;
-- нет elevation/DEM;
-- road-stress пока остаётся на уровне базовой bicycle-модели OTP;
-- нет аккаунтов, истории и сохранённых мест.
+```json
+{
+  "genericQueries": 8,
+  "genericCandidates": 24,
+  "anchorsConsidered": 8,
+  "anchorCandidates": 5,
+  "candidatesTotal": 29,
+  "returned": 8,
+  "elapsedMs": 1820
+}
+```
+
+У anchor-route появляется:
+
+```json
+{
+  "strategy": "egress_anchor",
+  "anchor": {
+    "name": "...",
+    "bikeEgressDistance": 4200
+  }
+}
+```
+
+## Ограничения текущего deep search
+
+- Реализован только egress-anchor. Boarding anchors будут следующим этапом.
+- Anchor generator использует GTFS topology и географическую эвристику, но ещё не знает качество велоинфраструктуры около остановки.
+- OSM Bike Stress enrichment ещё не реализован.
+- GTFS остаётся статическим, realtime Москвы не подключён.

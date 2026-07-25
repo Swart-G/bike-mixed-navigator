@@ -100,9 +100,7 @@ class OTPClient:
         transit_only: bool = False,
         direct_only: bool = False,
         first: int = 8,
-        access_mode: str = "BICYCLE",
         egress_mode: str = "BICYCLE",
-        transfer_mode: str = "BICYCLE",
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         cfg = PROFILE_CONFIG[profile]
 
@@ -113,9 +111,9 @@ class OTPClient:
             modes["directOnly"] = True
         elif transit_modes:
             modes["transit"] = {
-                "access": [access_mode],
+                "access": ["BICYCLE"],
                 "egress": [egress_mode],
-                "transfer": [transfer_mode],
+                "transfer": ["BICYCLE"],
                 "transit": [{"mode": mode} for mode in transit_modes],
             }
             if transit_only:
@@ -128,10 +126,7 @@ class OTPClient:
             "modes": modes,
             "preferences": {
                 "street": {
-                    "bicycle": {
-                        "speed": cfg["speed_mps"],
-                        "optimization": {"triangle": cfg["triangle"]},
-                    }
+                    "bicycle": {"optimization": {"triangle": cfg["triangle"]}}
                 },
                 "transit": {"transfer": {"maximumTransfers": max_transfers}},
             },
