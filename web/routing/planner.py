@@ -31,6 +31,15 @@ MODE_QUERIES = {
     "rail": ["RAIL"],
 }
 
+# Normal outcomes for exploratory candidate queries. A BUS/TRAM/RAIL-only
+# search can legitimately fail while the overall multimodal planner succeeds.
+SOFT_ROUTING_ERRORS = {
+    "NO_STOPS_IN_RANGE",
+    "WALKING_BETTER_THAN_TRANSIT",
+    "NO_TRANSIT_CONNECTION",
+    "NO_TRANSIT_CONNECTION_IN_SEARCH_WINDOW",
+}
+
 
 class RoutePlanner:
     def __init__(
@@ -112,6 +121,16 @@ class RoutePlanner:
         all_candidates = [self._score_route(r, profile) for r in all_candidates]
         selected = self._select_diverse(all_candidates, limit=8)
         self._assign_recommendation_labels(selected)
+
+        # We intentionally run several narrow exploratory searches. A failure
+        # in one of them is not a route-planning failure. Suppress these soft
+        # diagnostics whenever the combined search produced usable routes.
+        if selected:
+            warnings = [
+                warning
+                for warning in warnings
+                if warning.get("code") not in SOFT_ROUTING_ERRORS
+            ]
 
         return {
             "routes": selected,

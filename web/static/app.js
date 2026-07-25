@@ -132,14 +132,14 @@ document.querySelectorAll(".map-pick").forEach((button) => {
 });
 
 const PROFILE_UI = {
-  fast: { label: "Быстро", speed: 22 },
-  balanced: { label: "Баланс", speed: 18 },
-  calm: { label: "Спокойно", speed: 15 },
+  fast: { label: "Быстро", speed: 14 },
+  balanced: { label: "Баланс", speed: 11 },
+  calm: { label: "Спокойно", speed: 8.5 },
 };
 
 function updateProfileSummary() {
   const profile = PROFILE_UI[state.profile] || PROFILE_UI.balanced;
-  $("profile-summary").textContent = `${profile.label} · ~${profile.speed} км/ч`;
+  $("profile-summary").textContent = `${profile.label} · ~${profile.speed} км/ч средняя`;
 }
 
 document.querySelectorAll("#profile-selector button").forEach((button) => {
@@ -295,6 +295,7 @@ async function calculateRoutes() {
 function renderWarnings(warnings) {
   const ignored = new Set([
     "WALKING_BETTER_THAN_TRANSIT",
+    "NO_STOPS_IN_RANGE",
     "NO_TRANSIT_CONNECTION",
     "NO_TRANSIT_CONNECTION_IN_SEARCH_WINDOW",
   ]);
