@@ -244,8 +244,10 @@ async function calculateRoutes() {
       const stats = data.stats || {};
       const candidates = stats.candidatesTotal ?? state.routes.length;
       const anchors = stats.anchorCandidates ?? 0;
+      const optimized = stats.transitOptimizedCandidates ?? 0;
+      const comparisons = stats.bikeComparisons ?? 0;
       const elapsed = stats.elapsedMs ? ` · ${(stats.elapsedMs / 1000).toFixed(1)} с` : "";
-      $("results-summary").textContent = `${state.routes.length} из ${candidates} кандидатов · anchors ${anchors}${elapsed}`;
+      $("results-summary").textContent = `${state.routes.length} из ${candidates} · ОТ→вело ${optimized} · сравнений ${comparisons} · anchors ${anchors}${elapsed}`;
       if (stats.deepSearchError) {
         showDeepSearchWarning(stats.deepSearchError);
       }
@@ -321,6 +323,11 @@ function renderRoutes() {
       ? `<span class="badge anchor">выход: ${escapeHtml(route.anchor.name)} → 🚲 ${(route.anchor.bikeEgressDistance / 1000).toFixed(1)} км</span>`
       : "";
 
+    const optimization = route.optimization || null;
+    const optimizationBadge = optimization && (optimization.replacedWalkLegs || optimization.replacedTransitCount)
+      ? `<span class="badge optimized">🚲 заменено: ${optimization.replacedWalkLegs || 0} пеш. + ${optimization.replacedTransitCount || 0} ОТ</span>`
+      : "";
+
     card.innerHTML = `
       <div class="route-top">
         <div>
@@ -334,6 +341,7 @@ function renderRoutes() {
         ${waitBadge}
         ${transitBadge}
         ${anchorBadge}
+        ${optimizationBadge}
         ${route.transfers ? `<span class="badge">${route.transfers} перес.</span>` : ""}
       </div>
 

@@ -23,7 +23,7 @@ NOMINATIM_URL = os.environ.get(
     "NOMINATIM_URL", "https://nominatim.openstreetmap.org/search"
 )
 NOMINATIM_USER_AGENT = os.environ.get(
-    "NOMINATIM_USER_AGENT", "MixedNavigatorPrototype/0.2"
+    "NOMINATIM_USER_AGENT", "MixedNavigatorPrototype/0.3"
 )
 
 planner = RoutePlanner(

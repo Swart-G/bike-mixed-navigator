@@ -100,7 +100,9 @@ class OTPClient:
         transit_only: bool = False,
         direct_only: bool = False,
         first: int = 8,
+        access_mode: str = "BICYCLE",
         egress_mode: str = "BICYCLE",
+        transfer_mode: str = "BICYCLE",
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         cfg = PROFILE_CONFIG[profile]
 
@@ -111,9 +113,9 @@ class OTPClient:
             modes["directOnly"] = True
         elif transit_modes:
             modes["transit"] = {
-                "access": ["BICYCLE"],
+                "access": [access_mode],
                 "egress": [egress_mode],
-                "transfer": ["BICYCLE"],
+                "transfer": [transfer_mode],
                 "transit": [{"mode": mode} for mode in transit_modes],
             }
             if transit_only:
