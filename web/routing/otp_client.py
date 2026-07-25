@@ -128,7 +128,10 @@ class OTPClient:
             "modes": modes,
             "preferences": {
                 "street": {
-                    "bicycle": {"optimization": {"triangle": cfg["triangle"]}}
+                    "bicycle": {
+                        "speed": cfg["speed_mps"],
+                        "optimization": {"triangle": cfg["triangle"]},
+                    }
                 },
                 "transit": {"transfer": {"maximumTransfers": max_transfers}},
             },

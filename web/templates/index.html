@@ -58,13 +58,6 @@
 
         <div class="separator"></div>
 
-        <div class="profile-label">Стиль поездки</div>
-        <div class="segments" id="profile-selector">
-          <button data-profile="fast" type="button">Быстро</button>
-          <button class="active" data-profile="balanced" type="button">Баланс</button>
-          <button data-profile="calm" type="button">Спокойно</button>
-        </div>
-
         <div class="controls-grid">
           <div>
             <label for="departure">Отправление</label>
@@ -73,11 +66,61 @@
           <div>
             <label for="max-transfers">Пересадки</label>
             <select id="max-transfers">
-              <option value="0">0</option>
-              <option value="1">до 1</option>
               <option value="2" selected>до 2</option>
               <option value="3">до 3</option>
+              <option value="4">до 4</option>
+              <option value="5">до 5</option>
             </select>
+          </div>
+        </div>
+
+        <div class="settings-wrap">
+          <button id="settings-button" class="settings-button" type="button" aria-expanded="false">
+            <span class="settings-button-icon">⚙</span>
+            <span class="settings-button-copy">
+              <span class="settings-button-label">Настройки поездки</span>
+              <span id="profile-summary" class="settings-button-value">Баланс · ~18 км/ч</span>
+            </span>
+            <span class="settings-chevron">⌄</span>
+          </button>
+
+          <div id="settings-panel" class="settings-panel hidden">
+            <div class="settings-title">Стиль поездки</div>
+            <div class="settings-subtitle">
+              Влияет на скорость велосипеда и приоритет спокойных улиц.
+            </div>
+
+            <div id="profile-selector" class="profile-options">
+              <button class="profile-option" data-profile="fast" type="button">
+                <span class="profile-option-top">
+                  <strong>Быстро</strong>
+                  <span>~22 км/ч</span>
+                </span>
+                <span class="profile-option-description">
+                  Быстрый городской темп. Сильнее ценит время и допускает более оживлённые улицы.
+                </span>
+              </button>
+
+              <button class="profile-option active" data-profile="balanced" type="button">
+                <span class="profile-option-top">
+                  <strong>Баланс</strong>
+                  <span>~18 км/ч</span>
+                </span>
+                <span class="profile-option-description">
+                  Обычный темп. Баланс скорости, удобства и спокойных велосипедных участков.
+                </span>
+              </button>
+
+              <button class="profile-option" data-profile="calm" type="button">
+                <span class="profile-option-top">
+                  <strong>Спокойно</strong>
+                  <span>~15 км/ч</span>
+                </span>
+                <span class="profile-option-description">
+                  Неспешная поездка. Сильнее избегает неприятных дорог даже ценой нескольких минут.
+                </span>
+              </button>
+            </div>
           </div>
         </div>
 

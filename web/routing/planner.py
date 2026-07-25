@@ -71,7 +71,7 @@ class RoutePlanner:
         if profile not in PROFILE_CONFIG:
             profile = "balanced"
         try:
-            max_transfers = min(5, max(0, int(payload.get("maxTransfers", 2))))
+            max_transfers = min(5, max(2, int(payload.get("maxTransfers", 2))))
         except (TypeError, ValueError):
             max_transfers = 2
 
@@ -185,24 +185,7 @@ class RoutePlanner:
                 "max_transfers": max_transfers,
                 "strategy": "mode_rail",
             },
-            {
-                "name": "no_transfers",
-                "profile": selected_profile,
-                "modes": ALL_TRANSIT,
-                "max_transfers": 0,
-                "strategy": "no_transfers",
-            },
         ]
-        if max_transfers >= 1:
-            specs.append(
-                {
-                    "name": "one_transfer",
-                    "profile": selected_profile,
-                    "modes": ALL_TRANSIT,
-                    "max_transfers": 1,
-                    "strategy": "one_transfer",
-                }
-            )
 
         origin_loc = coordinate_location(*origin, "Старт")
         destination_loc = coordinate_location(*destination, "Финиш")
@@ -265,10 +248,7 @@ class RoutePlanner:
             {"name": "pt_bus", "modes": MODE_QUERIES["bus"], "max_transfers": max_transfers},
             {"name": "pt_tram", "modes": MODE_QUERIES["tram"], "max_transfers": max_transfers},
             {"name": "pt_rail", "modes": MODE_QUERIES["rail"], "max_transfers": max_transfers},
-            {"name": "pt_direct", "modes": ALL_TRANSIT, "max_transfers": 0},
         ]
-        if max_transfers >= 1:
-            specs.append({"name": "pt_one_transfer", "modes": ALL_TRANSIT, "max_transfers": 1})
 
         origin_loc = coordinate_location(*origin, "Старт")
         destination_loc = coordinate_location(*destination, "Финиш")
@@ -375,6 +355,8 @@ class RoutePlanner:
         if not original_legs:
             return None, 0
 
+        cfg = PROFILE_CONFIG[profile]
+
         comparisons = 0
         choices: list[dict[str, Any]] = []
         replaced_walk = 0
@@ -417,8 +399,22 @@ class RoutePlanner:
                     saved_seconds = duration - bike_duration
                 elif is_transit:
                     effective_transit = wait_before + duration + 45
-                    # Require a real advantage so we don't remove useful transit for 5 seconds.
-                    replace = bike_duration + 30 < effective_transit
+                    bike_distance = float(bike.get("bikeDistance") or 0)
+
+                    # Public transport is the skeleton of the route. We only remove a transit
+                    # leg when it is a genuinely short "micro-leg" that is quicker to cycle.
+                    # Long BUS/TRAM/RAIL legs are preserved even when a straight bicycle path
+                    # between their endpoints is mathematically faster. Long bicycle egress is
+                    # handled by the dedicated egress-anchor search instead.
+                    short_enough = (
+                        bike_distance <= cfg["transit_replace_max_bike_distance"]
+                        and bike_duration <= cfg["transit_replace_max_bike_duration"]
+                    )
+                    enough_saving = (
+                        effective_transit - bike_duration
+                        >= cfg["transit_replace_min_saving"]
+                    )
+                    replace = short_enough and enough_saving
                     saved_seconds = effective_transit - bike_duration
 
             if replace and bike is not None:

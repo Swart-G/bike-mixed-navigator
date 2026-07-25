@@ -131,13 +131,41 @@ document.querySelectorAll(".map-pick").forEach((button) => {
   button.addEventListener("click", () => setPicking(button.dataset.target));
 });
 
+const PROFILE_UI = {
+  fast: { label: "Быстро", speed: 22 },
+  balanced: { label: "Баланс", speed: 18 },
+  calm: { label: "Спокойно", speed: 15 },
+};
+
+function updateProfileSummary() {
+  const profile = PROFILE_UI[state.profile] || PROFILE_UI.balanced;
+  $("profile-summary").textContent = `${profile.label} · ~${profile.speed} км/ч`;
+}
+
 document.querySelectorAll("#profile-selector button").forEach((button) => {
   button.addEventListener("click", () => {
     state.profile = button.dataset.profile;
     document.querySelectorAll("#profile-selector button").forEach((item) => {
       item.classList.toggle("active", item === button);
     });
+    updateProfileSummary();
   });
+});
+
+$("settings-button").addEventListener("click", () => {
+  const panel = $("settings-panel");
+  const opening = panel.classList.contains("hidden");
+  panel.classList.toggle("hidden", !opening);
+  $("settings-button").classList.toggle("active", opening);
+  $("settings-button").setAttribute("aria-expanded", String(opening));
+});
+
+document.addEventListener("click", (event) => {
+  if (!event.target.closest(".settings-wrap")) {
+    $("settings-panel").classList.add("hidden");
+    $("settings-button").classList.remove("active");
+    $("settings-button").setAttribute("aria-expanded", "false");
+  }
 });
 
 document.querySelectorAll("[data-search]").forEach((button) => {
@@ -548,6 +576,7 @@ async function checkOtp() {
 }
 
 initMoscowTime();
+updateProfileSummary();
 setPicking("origin");
 updateSummary();
 checkOtp();
