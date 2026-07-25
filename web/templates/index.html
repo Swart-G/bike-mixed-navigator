@@ -1,0 +1,127 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <title>Смешанный навигатор</title>
+  <link rel="stylesheet" href="https://unpkg.com/maplibre-gl@6.0.0/dist/maplibre-gl.css">
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar">
+      <header class="brand">
+        <div class="brand-mark">M</div>
+        <div>
+          <div class="brand-title">Смешанный навигатор</div>
+          <div class="brand-subtitle">Москва · велосипед + транспорт</div>
+        </div>
+        <span id="otp-status" class="status-dot" title="OTP"></span>
+      </header>
+
+      <section class="planner-card">
+        <div class="location-block">
+          <div class="location-rail">
+            <span class="location-dot origin-dot"></span>
+            <span class="location-line"></span>
+            <span class="location-dot destination-dot"></span>
+          </div>
+
+          <div class="location-fields">
+            <div class="location-field">
+              <div class="field-topline">
+                <label for="origin-search">Откуда</label>
+                <button class="map-pick" data-target="origin" type="button">На карте</button>
+              </div>
+              <div class="search-row">
+                <input id="origin-search" autocomplete="off" placeholder="Адрес или место">
+                <button class="search-button" data-search="origin" type="button">⌕</button>
+              </div>
+              <div id="origin-coords" class="coords">Не выбрано</div>
+              <div id="origin-results" class="search-results hidden"></div>
+            </div>
+
+            <div class="location-field">
+              <div class="field-topline">
+                <label for="destination-search">Куда</label>
+                <button class="map-pick" data-target="destination" type="button">На карте</button>
+              </div>
+              <div class="search-row">
+                <input id="destination-search" autocomplete="off" placeholder="Адрес или место">
+                <button class="search-button" data-search="destination" type="button">⌕</button>
+              </div>
+              <div id="destination-coords" class="coords">Не выбрано</div>
+              <div id="destination-results" class="search-results hidden"></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="separator"></div>
+
+        <div class="profile-label">Стиль поездки</div>
+        <div class="segments" id="profile-selector">
+          <button data-profile="fast" type="button">Быстро</button>
+          <button class="active" data-profile="balanced" type="button">Баланс</button>
+          <button data-profile="calm" type="button">Спокойно</button>
+        </div>
+
+        <div class="controls-grid">
+          <div>
+            <label for="departure">Отправление</label>
+            <input id="departure" type="datetime-local">
+          </div>
+          <div>
+            <label for="max-transfers">Пересадки</label>
+            <select id="max-transfers">
+              <option value="0">0</option>
+              <option value="1">до 1</option>
+              <option value="2" selected>до 2</option>
+              <option value="3">до 3</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="planner-meta">
+          <span>Велосипед с собой</span>
+          <span>•</span>
+          <span>Метро исключено</span>
+        </div>
+
+        <button id="route-button" class="primary-button" type="button">Построить маршрут</button>
+        <div id="planner-error" class="error-message hidden"></div>
+      </section>
+
+      <section class="results-section">
+        <div class="results-header">
+          <div>
+            <div class="results-title">Варианты</div>
+            <div id="results-summary" class="results-summary">Выберите две точки</div>
+          </div>
+          <button id="clear-button" class="text-button" type="button">Сбросить</button>
+        </div>
+
+        <div id="loading" class="loading hidden">
+          <span class="spinner"></span>
+          <span>Считаю варианты…</span>
+        </div>
+
+        <div id="warnings" class="warnings hidden"></div>
+        <div id="route-list" class="route-list"></div>
+      </section>
+    </aside>
+
+    <main class="map-wrap">
+      <div id="map"></div>
+      <div id="map-hint" class="map-hint">Нажмите на карту, чтобы поставить старт</div>
+      <div class="map-legend">
+        <span><i class="legend-bike"></i>Велосипед</span>
+        <span><i class="legend-transit"></i>Транспорт</span>
+        <span><i class="legend-walk"></i>Пешком</span>
+      </div>
+    </main>
+  </div>
+
+  <script src="https://unpkg.com/maplibre-gl@6.0.0/dist/maplibre-gl.js"></script>
+  <script src="/static/app.js"></script>
+</body>
+</html>

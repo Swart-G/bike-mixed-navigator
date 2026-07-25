@@ -1,0 +1,40 @@
+services:
+  otp:
+    image: docker.io/opentripplanner/opentripplanner:2.9.0_2026-03-13T14-37
+    container_name: otp-moscow
+
+    ports:
+      - "8080:8080"
+
+    environment:
+      JAVA_TOOL_OPTIONS: "-Xmx12g"
+
+    volumes:
+      - ./data:/var/opentripplanner:Z
+
+    command:
+      - --build
+      - --serve
+
+    restart: unless-stopped
+
+  web:
+    build: ./web
+    container_name: mixed-navigator-web
+
+    ports:
+      - "5000:5000"
+
+    environment:
+      OTP_URL: "http://otp:8080/otp/gtfs/v1"
+      GTFS_PATH: "/otp-data/moscow-gtfs.zip"
+      OTP_FEED_ID: "1"
+      NOMINATIM_USER_AGENT: "MixedNavigatorPrototype/0.2"
+
+    volumes:
+      - ./data:/otp-data:ro
+
+    depends_on:
+      - otp
+
+    restart: unless-stopped

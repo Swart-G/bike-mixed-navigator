@@ -1,0 +1,10 @@
+services:
+  web:
+    build: .
+    container_name: mixed-navigator-web
+    ports:
+      - "5000:5000"
+    environment:
+      OTP_URL: "http://otp:8080/otp/gtfs/v1"
+      NOMINATIM_USER_AGENT: "MixedNavigatorPrototype/0.1"
+    restart: unless-stopped
