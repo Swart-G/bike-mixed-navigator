@@ -46,6 +46,55 @@ PROFILE_CONFIG = {
 }
 
 
+ROUTE_FOCUS_CONFIG = {
+    -2: {
+        "key": "transit",
+        "name": "Больше транспорта",
+        "bike_share_shift": -0.32,
+        "share_penalty_seconds": 1500,
+        "transfer_penalty_factor": 0.70,
+        "time_tolerance_ratio": 0.30,
+        "anchor_limit": 9,
+    },
+    -1: {
+        "key": "transit_lean",
+        "name": "Скорее транспорт",
+        "bike_share_shift": -0.16,
+        "share_penalty_seconds": 1200,
+        "transfer_penalty_factor": 0.85,
+        "time_tolerance_ratio": 0.25,
+        "anchor_limit": 10,
+    },
+    0: {
+        "key": "balanced",
+        "name": "Баланс",
+        "bike_share_shift": 0.0,
+        "share_penalty_seconds": 900,
+        "transfer_penalty_factor": 1.0,
+        "time_tolerance_ratio": 0.25,
+        "anchor_limit": 12,
+    },
+    1: {
+        "key": "bike_lean",
+        "name": "Больше велосипеда",
+        "bike_share_shift": 0.20,
+        "share_penalty_seconds": 1200,
+        "transfer_penalty_factor": 1.15,
+        "time_tolerance_ratio": 0.38,
+        "anchor_limit": 14,
+    },
+    2: {
+        "key": "ride",
+        "name": "Велопрогулка",
+        "bike_share_shift": 0.42,
+        "share_penalty_seconds": 1500,
+        "transfer_penalty_factor": 1.30,
+        "time_tolerance_ratio": 0.55,
+        "anchor_limit": 16,
+    },
+}
+
+
 def parse_coordinate(obj: Any, name: str) -> tuple[float, float]:
     if not isinstance(obj, dict):
         raise ValueError(f"{name}: ожидается объект lat/lon.")

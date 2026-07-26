@@ -71,6 +71,7 @@
               <option value="4">до 4</option>
               <option value="5">до 5</option>
             </select>
+            <span class="control-hint">Только смены ОТ; велосипед не считается.</span>
           </div>
         </div>
 
@@ -79,7 +80,7 @@
             <span class="settings-button-icon">⚙</span>
             <span class="settings-button-copy">
               <span class="settings-button-label">Настройки поездки</span>
-              <span id="profile-summary" class="settings-button-value">Баланс · ~11 км/ч</span>
+              <span id="profile-summary" class="settings-button-value">Баланс · ~11 км/ч · маршрут: баланс</span>
             </span>
             <span class="settings-chevron">⌄</span>
           </button>
@@ -120,6 +121,28 @@
                   Спокойная поездка без спешки. Около 8.5 км/ч в среднем и больший приоритет тихих улиц.
                 </span>
               </button>
+            </div>
+
+            <div class="settings-divider"></div>
+
+            <div class="settings-title">Упор маршрута</div>
+            <div class="settings-subtitle">
+              Это не жёсткая доля. Алгоритм учитывает длину поездки и сам выбирает разумный баланс.
+            </div>
+
+            <div class="route-focus-control">
+              <input id="route-focus" type="range" min="-2" max="2" step="1" value="0">
+              <div class="route-focus-scale" aria-hidden="true">
+                <span>ОТ</span>
+                <span>Баланс</span>
+                <span>Вело</span>
+              </div>
+              <div class="route-focus-card">
+                <strong id="route-focus-name">Баланс</strong>
+                <span id="route-focus-description">
+                  Время остаётся главным фактором, но алгоритм старается сохранять разумную долю велосипеда.
+                </span>
+              </div>
             </div>
           </div>
         </div>

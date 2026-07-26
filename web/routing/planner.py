@@ -12,6 +12,7 @@ from typing import Any
 from .gtfs_index import Anchor, GtfsIndex
 from .models import (
     PROFILE_CONFIG,
+    ROUTE_FOCUS_CONFIG,
     MOSCOW_TZ,
     decode_polyline,
     normalized_signature,
@@ -29,6 +30,9 @@ MODE_QUERIES = {
     "bus": ["BUS", "TROLLEYBUS"],
     "tram": ["TRAM"],
     "rail": ["RAIL"],
+    "bus_tram": ["BUS", "TROLLEYBUS", "TRAM"],
+    "bus_rail": ["BUS", "TROLLEYBUS", "RAIL"],
+    "tram_rail": ["TRAM", "RAIL"],
 }
 
 # Normal outcomes for exploratory candidate queries. A BUS/TRAM/RAIL-only
@@ -84,13 +88,24 @@ class RoutePlanner:
         except (TypeError, ValueError):
             max_transfers = 2
 
+        try:
+            route_focus = min(2, max(-2, int(payload.get("routeFocus", 0))))
+        except (TypeError, ValueError):
+            route_focus = 0
+        focus_cfg = ROUTE_FOCUS_CONFIG[route_focus]
+
         generic_routes, warnings, query_stats = self._generic_candidates(
             origin, destination, departure, profile, max_transfers
         )
 
         transit_first_routes, transit_first_warnings, transit_first_stats = (
             self._transit_first_candidates(
-                origin, destination, departure, profile, max_transfers
+                origin,
+                destination,
+                departure,
+                profile,
+                max_transfers,
+                route_focus,
             )
         )
         warnings.extend(transit_first_warnings)
@@ -100,7 +115,12 @@ class RoutePlanner:
         anchor_error = None
         if payload.get("deepSearch", True):
             try:
-                anchors = self.gtfs.egress_anchors(origin, destination, limit=8)
+                anchors = self.gtfs.egress_anchors(
+                    origin,
+                    destination,
+                    limit=focus_cfg["anchor_limit"],
+                    route_focus=route_focus,
+                )
                 anchor_routes = self._egress_anchor_candidates(
                     anchors, origin, destination, departure, profile, max_transfers
                 )
@@ -118,8 +138,33 @@ class RoutePlanner:
         all_candidates = self._dedupe_exact(
             generic_for_merge + transit_first_routes + anchor_routes
         )
+
+        # Recompute transfer counts after every transformation/composition and
+        # enforce the user's setting locally as a hard constraint. This is
+        # intentionally independent of OTP's own maximumTransfers request.
+        before_transfer_filter = len(all_candidates)
+        all_candidates = [
+            self._refresh_route_metrics(route)
+            for route in all_candidates
+        ]
+        all_candidates = [
+            route
+            for route in all_candidates
+            if int(route.get("transfers") or 0) <= max_transfers
+        ]
+        transfer_filtered = before_transfer_filter - len(all_candidates)
+
         all_candidates = [self._score_route(r, profile) for r in all_candidates]
-        selected = self._select_diverse(all_candidates, limit=8)
+        all_candidates = self._apply_route_focus(
+            all_candidates,
+            profile_key=profile,
+            route_focus=route_focus,
+        )
+        selected = self._select_diverse(
+            all_candidates,
+            limit=10,
+            route_focus=route_focus,
+        )
         self._assign_recommendation_labels(selected)
 
         # We intentionally run several narrow exploratory searches. A failure
@@ -145,6 +190,10 @@ class RoutePlanner:
                 "anchorsConsidered": len(anchors),
                 "anchorCandidates": len(anchor_routes),
                 "candidatesTotal": len(all_candidates),
+                "transferFiltered": transfer_filtered,
+                "maxTransfers": max_transfers,
+                "routeFocus": route_focus,
+                "routeFocusName": focus_cfg["name"],
                 "returned": len(selected),
                 "deepSearchAvailable": self.gtfs.loaded,
                 "deepSearchError": anchor_error or self.gtfs.error,
@@ -204,6 +253,34 @@ class RoutePlanner:
                 "max_transfers": max_transfers,
                 "strategy": "mode_rail",
             },
+            {
+                "name": "bus_tram",
+                "profile": selected_profile,
+                "modes": MODE_QUERIES["bus_tram"],
+                "max_transfers": max_transfers,
+                "strategy": "mode_bus_tram",
+            },
+            {
+                "name": "bus_rail",
+                "profile": selected_profile,
+                "modes": MODE_QUERIES["bus_rail"],
+                "max_transfers": max_transfers,
+                "strategy": "mode_bus_rail",
+            },
+            {
+                "name": "tram_rail",
+                "profile": selected_profile,
+                "modes": MODE_QUERIES["tram_rail"],
+                "max_transfers": max_transfers,
+                "strategy": "mode_tram_rail",
+            },
+            {
+                "name": "simple",
+                "profile": selected_profile,
+                "modes": ALL_TRANSIT,
+                "max_transfers": min(1, max_transfers),
+                "strategy": "simple_transit",
+            },
         ]
 
         origin_loc = coordinate_location(*origin, "Старт")
@@ -221,7 +298,7 @@ class RoutePlanner:
                 max_transfers=spec["max_transfers"],
                 direct_bike=spec.get("direct_bike", False),
                 transit_only=not spec.get("direct_bike", False),
-                first=10,
+                first=14,
             )
             local_routes = []
             for node in nodes:
@@ -255,6 +332,7 @@ class RoutePlanner:
         departure: datetime,
         profile: str,
         max_transfers: int,
+        route_focus: int = 0,
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, int]]:
         """Build public-transport skeletons first, then optimize every segment with bicycle.
 
@@ -267,6 +345,10 @@ class RoutePlanner:
             {"name": "pt_bus", "modes": MODE_QUERIES["bus"], "max_transfers": max_transfers},
             {"name": "pt_tram", "modes": MODE_QUERIES["tram"], "max_transfers": max_transfers},
             {"name": "pt_rail", "modes": MODE_QUERIES["rail"], "max_transfers": max_transfers},
+            {"name": "pt_bus_tram", "modes": MODE_QUERIES["bus_tram"], "max_transfers": max_transfers},
+            {"name": "pt_bus_rail", "modes": MODE_QUERIES["bus_rail"], "max_transfers": max_transfers},
+            {"name": "pt_tram_rail", "modes": MODE_QUERIES["tram_rail"], "max_transfers": max_transfers},
+            {"name": "pt_simple", "modes": ALL_TRANSIT, "max_transfers": min(1, max_transfers)},
         ]
 
         origin_loc = coordinate_location(*origin, "Старт")
@@ -286,7 +368,7 @@ class RoutePlanner:
                 access_mode="WALK",
                 egress_mode="WALK",
                 transfer_mode="WALK",
-                first=8,
+                first=12,
             )
             local = []
             for node in nodes:
@@ -323,14 +405,19 @@ class RoutePlanner:
                 continue
             seen_signatures.add(signature)
             preselected.append(route)
-            if len(preselected) >= 14:
+            if len(preselected) >= 24:
                 break
 
         comparison_counter = [0]
         counter_lock = threading.Lock()
 
         def optimize(route: dict[str, Any]):
-            optimized, comparisons = self._optimize_transit_skeleton(route, departure, profile)
+            optimized, comparisons = self._optimize_transit_skeleton(
+                route,
+                departure,
+                profile,
+                route_focus,
+            )
             with counter_lock:
                 comparison_counter[0] += comparisons
             return optimized
@@ -363,6 +450,7 @@ class RoutePlanner:
         skeleton: dict[str, Any],
         requested_departure: datetime,
         profile: str,
+        route_focus: int = 0,
     ) -> tuple[dict[str, Any] | None, int]:
         """Replace WALK and inefficient transit legs with direct bicycle legs.
 
@@ -375,6 +463,39 @@ class RoutePlanner:
             return None, 0
 
         cfg = PROFILE_CONFIG[profile]
+        route_focus = min(2, max(-2, int(route_focus)))
+
+        distance_factor = {
+            -2: 0.45,
+            -1: 0.70,
+            0: 1.00,
+            1: 1.45,
+            2: 2.10,
+        }[route_focus]
+        duration_factor = {
+            -2: 0.65,
+            -1: 0.80,
+            0: 1.00,
+            1: 1.30,
+            2: 1.65,
+        }[route_focus]
+        saving_factor = {
+            -2: 1.50,
+            -1: 1.20,
+            0: 1.00,
+            1: 0.80,
+            2: 0.60,
+        }[route_focus]
+
+        transit_replace_max_distance = (
+            float(cfg["transit_replace_max_bike_distance"]) * distance_factor
+        )
+        transit_replace_max_duration = (
+            float(cfg["transit_replace_max_bike_duration"]) * duration_factor
+        )
+        transit_replace_min_saving = (
+            float(cfg["transit_replace_min_saving"]) * saving_factor
+        )
 
         comparisons = 0
         choices: list[dict[str, Any]] = []
@@ -426,12 +547,12 @@ class RoutePlanner:
                     # between their endpoints is mathematically faster. Long bicycle egress is
                     # handled by the dedicated egress-anchor search instead.
                     short_enough = (
-                        bike_distance <= cfg["transit_replace_max_bike_distance"]
-                        and bike_duration <= cfg["transit_replace_max_bike_duration"]
+                        bike_distance <= transit_replace_max_distance
+                        and bike_duration <= transit_replace_max_duration
                     )
                     enough_saving = (
                         effective_transit - bike_duration
-                        >= cfg["transit_replace_min_saving"]
+                        >= transit_replace_min_saving
                     )
                     replace = short_enough and enough_saving
                     saved_seconds = effective_transit - bike_duration
@@ -840,6 +961,8 @@ class RoutePlanner:
                     "startTime": leg.get("startTime"),
                     "endTime": leg.get("endTime"),
                     "realTime": bool(leg.get("realTime")),
+                    "interlineWithPreviousLeg": bool(leg.get("interlineWithPreviousLeg")),
+                    "tripId": (leg.get("trip") or {}).get("gtfsId"),
                     "from": {
                         "name": from_obj.get("name") or "Старт",
                         "lat": from_obj.get("lat"),
@@ -935,7 +1058,193 @@ class RoutePlanner:
         }
         return self._score_route(route, profile)
 
+    @staticmethod
+    def _actual_transfer_count(route: dict[str, Any]) -> int:
+        """Count actual changes between public-transport vehicles.
+
+        OTP's numberOfTransfers is useful, but routes are later transformed and
+        composed by our own planner. We therefore recompute the number from the
+        final leg list. Interlined legs do not count as a new boarding.
+        """
+        boardings = 0
+        previous_trip: str | None = None
+
+        for leg in route.get("legs") or []:
+            if not leg.get("transitLeg"):
+                # Leaving transit means a later boarding counts again, even if
+                # a pathological feed happens to reuse the same trip id.
+                previous_trip = None
+                continue
+
+            trip_id = leg.get("tripId")
+            interline = bool(leg.get("interlineWithPreviousLeg"))
+
+            if interline:
+                previous_trip = trip_id or previous_trip
+                continue
+
+            # A split leg belonging to the exact same trip is not a transfer.
+            if trip_id and previous_trip and trip_id == previous_trip:
+                continue
+
+            boardings += 1
+            previous_trip = trip_id
+
+        return max(0, boardings - 1)
+
+    def _refresh_route_metrics(self, route: dict[str, Any]) -> dict[str, Any]:
+        """Recompute metrics from the final leg list after all transformations."""
+        route = deepcopy(route)
+        legs = route.get("legs") or []
+
+        bike_distance = sum(
+            float(leg.get("distance") or 0)
+            for leg in legs
+            if leg.get("mode") == "BICYCLE" and not leg.get("transitLeg")
+        )
+        walk_distance = sum(
+            float(leg.get("distance") or 0)
+            for leg in legs
+            if leg.get("mode") == "WALK" and not leg.get("transitLeg")
+        )
+        transit_distance = sum(
+            float(leg.get("distance") or 0)
+            for leg in legs
+            if leg.get("transitLeg")
+        )
+
+        boardings = self._actual_transfer_count(route) + (
+            1 if any(leg.get("transitLeg") for leg in legs) else 0
+        )
+
+        route["bikeDistance"] = round(bike_distance, 1)
+        route["walkDistance"] = round(walk_distance, 1)
+        route["transitDistance"] = round(transit_distance, 1)
+        route["bikeBoardings"] = boardings
+        route["transfers"] = max(0, boardings - 1)
+
+        movement = bike_distance + transit_distance
+        route["bikeShare"] = round(bike_distance / movement, 4) if movement > 0 else 0.0
+        route["transitShare"] = round(transit_distance / movement, 4) if movement > 0 else 0.0
+        return route
+
+    @staticmethod
+    def _base_target_bike_share(reference_distance_m: float) -> float:
+        """Adaptive bicycle share before applying the user's preference.
+
+        Short trips naturally favour the bicycle; long trips naturally favour
+        transit. The focus setting moves this baseline instead of replacing it
+        with a fixed percentage.
+        """
+        if reference_distance_m <= 4_000:
+            return 0.88
+        if reference_distance_m <= 8_000:
+            return 0.68
+        if reference_distance_m <= 15_000:
+            return 0.48
+        if reference_distance_m <= 25_000:
+            return 0.32
+        return 0.20
+
+    def _apply_route_focus(
+        self,
+        routes: list[dict[str, Any]],
+        *,
+        profile_key: str,
+        route_focus: int,
+    ) -> list[dict[str, Any]]:
+        if not routes:
+            return []
+
+        route_focus = min(2, max(-2, int(route_focus)))
+        focus_cfg = ROUTE_FOCUS_CONFIG[route_focus]
+        profile_cfg = PROFILE_CONFIG[profile_key]
+
+        direct_bikes = [
+            route
+            for route in routes
+            if route.get("kind") == "bike" and float(route.get("bikeDistance") or 0) > 0
+        ]
+        if direct_bikes:
+            reference_distance = min(
+                float(route.get("bikeDistance") or 0)
+                for route in direct_bikes
+            )
+        else:
+            reference_distance = max(
+                (
+                    float(route.get("bikeDistance") or 0)
+                    + float(route.get("transitDistance") or 0)
+                )
+                for route in routes
+            )
+
+        base_target = self._base_target_bike_share(reference_distance)
+        target = min(
+            1.0,
+            max(0.05, base_target + float(focus_cfg["bike_share_shift"])),
+        )
+
+        best_time = max(1, min(int(route.get("doorToDoor") or 0) for route in routes))
+        allowed_ratio = 1.0 + float(focus_cfg["time_tolerance_ratio"])
+
+        result: list[dict[str, Any]] = []
+        for route in routes:
+            route = self._refresh_route_metrics(route)
+            bike_share = float(route.get("bikeShare") or 0)
+            base_score = float(route.get("baseScore", route.get("score", 0)) or 0)
+
+            # The preference is directional. A transport-heavy preference does
+            # not punish "too much transit", and a cycling-heavy preference does
+            # not punish "too much bicycle". Balance aims near the adaptive target.
+            if route_focus < 0:
+                share_gap = max(0.0, bike_share - target)
+            elif route_focus > 0:
+                share_gap = max(0.0, target - bike_share)
+            else:
+                share_gap = abs(bike_share - target)
+
+            share_penalty = share_gap * float(focus_cfg["share_penalty_seconds"])
+
+            # Transfer aversion is still present, but a transport-oriented user
+            # tolerates transfers somewhat more than a bicycle-oriented user.
+            transfer_adjustment = (
+                int(route.get("transfers") or 0)
+                * float(profile_cfg["transfer_penalty"])
+                * (float(focus_cfg["transfer_penalty_factor"]) - 1.0)
+            )
+
+            time_ratio = float(route.get("doorToDoor") or best_time) / best_time
+            detour_penalty = 0.0
+            if time_ratio > allowed_ratio:
+                detour_penalty = (
+                    (time_ratio - allowed_ratio) * best_time * 3.0
+                    + 240.0
+                )
+
+            preference_score = (
+                base_score
+                + share_penalty
+                + transfer_adjustment
+                + detour_penalty
+            )
+
+            route["score"] = round(preference_score)
+            route["preference"] = {
+                "focus": route_focus,
+                "focusName": focus_cfg["name"],
+                "targetBikeShare": round(target, 3),
+                "actualBikeShare": round(bike_share, 3),
+                "referenceDistance": round(reference_distance, 1),
+                "timeRatio": round(time_ratio, 3),
+                "allowedTimeRatio": round(allowed_ratio, 3),
+            }
+            result.append(route)
+
+        return result
+
     def _score_route(self, route: dict[str, Any], profile_key: str) -> dict[str, Any]:
+        route = self._refresh_route_metrics(route)
         cfg = PROFILE_CONFIG[profile_key]
         score = float(route.get("doorToDoor") or 0)
         score += float(route.get("waitingTime") or 0) * cfg["wait_factor"]
@@ -952,6 +1261,7 @@ class RoutePlanner:
             if total_movement > 0 and transit_distance / total_movement < 0.08:
                 score += 240
 
+        route["baseScore"] = round(score)
         route["score"] = round(score)
         route["transitModes"] = transit_modes(route)
         route["transitRoutes"] = transit_route_names(route)
@@ -994,13 +1304,32 @@ class RoutePlanner:
             result.append(warning)
         return result
 
-    def _select_diverse(self, routes: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
+    def _select_diverse(
+        self,
+        routes: list[dict[str, Any]],
+        limit: int,
+        route_focus: int = 0,
+    ) -> list[dict[str, Any]]:
         if not routes:
             return []
 
+        route_focus = min(2, max(-2, int(route_focus)))
+        focus_cfg = ROUTE_FOCUS_CONFIG[route_focus]
+
         routes = sorted(routes, key=lambda r: (r["score"], r["doorToDoor"]))
         best_time = min(r["doorToDoor"] for r in routes)
-        soft_limit = max(best_time * 1.50, best_time + 15 * 60)
+
+        min_extra = {
+            -2: 12 * 60,
+            -1: 12 * 60,
+            0: 15 * 60,
+            1: 22 * 60,
+            2: 30 * 60,
+        }[route_focus]
+        soft_limit = max(
+            best_time * (1.0 + float(focus_cfg["time_tolerance_ratio"])),
+            best_time + min_extra,
+        )
 
         selected: list[dict[str, Any]] = []
         selected_ids: set[int] = set()
@@ -1011,21 +1340,78 @@ class RoutePlanner:
                 return
             if not force and route["doorToDoor"] > soft_limit:
                 return
+
             cluster = normalized_signature(route)
             if not force and cluster_counts.get(cluster, 0) >= 1:
                 return
+
             selected.append(route)
             selected_ids.add(id(route))
             cluster_counts[cluster] = cluster_counts.get(cluster, 0) + 1
 
-        # Explicit diversity quotas. This is intentionally not "top N by score".
-        add(min(routes, key=lambda r: r["doorToDoor"]))
-        add(min(routes, key=lambda r: r["score"]))
-        add(self._best_matching(routes, lambda r: r.get("strategy") == "transit_optimized"), force=True)
-        add(self._best_matching(routes, lambda r: r.get("strategy") == "egress_anchor"))
-        add(self._best_matching(routes, lambda r: "BUS" in r.get("transitModes", []) or "TROLLEYBUS" in r.get("transitModes", [])))
-        add(self._best_matching(routes, lambda r: "TRAM" in r.get("transitModes", [])))
-        add(self._best_matching(routes, lambda r: "RAIL" in r.get("transitModes", [])))
+        eligible = [route for route in routes if route["doorToDoor"] <= soft_limit]
+        if not eligible:
+            eligible = routes
+
+        fastest = min(routes, key=lambda r: r["doorToDoor"])
+        best_score = min(routes, key=lambda r: (r["score"], r["doorToDoor"]))
+
+        # Candidate closest to the adaptive bicycle-share target.
+        focus_match = min(
+            eligible,
+            key=lambda r: (
+                abs(
+                    float(r.get("bikeShare") or 0)
+                    - float((r.get("preference") or {}).get("targetBikeShare", 0))
+                ),
+                r["score"],
+            ),
+        )
+
+        transit_heavy = min(
+            eligible,
+            key=lambda r: (
+                float(r.get("bikeShare") or 0),
+                r["score"],
+            ),
+        )
+        bike_heavy = max(
+            eligible,
+            key=lambda r: (
+                float(r.get("bikeShare") or 0),
+                -r["score"],
+            ),
+        )
+
+        # First slots depend on user intent. This changes actual output diversity,
+        # not just sorting.
+        add(fastest)
+        add(best_score)
+        add(focus_match)
+
+        if route_focus < 0:
+            add(transit_heavy)
+            add(self._best_matching(eligible, lambda r: r.get("strategy") == "transit_optimized"))
+            add(bike_heavy)
+        elif route_focus > 0:
+            add(bike_heavy)
+            add(self._best_matching(eligible, lambda r: r.get("strategy") == "egress_anchor"))
+            add(transit_heavy)
+        else:
+            add(self._best_matching(eligible, lambda r: r.get("strategy") == "transit_optimized"))
+            add(self._best_matching(eligible, lambda r: r.get("strategy") == "egress_anchor"))
+
+        # Mode diversity.
+        add(self._best_matching(
+            eligible,
+            lambda r: "BUS" in r.get("transitModes", [])
+            or "TROLLEYBUS" in r.get("transitModes", []),
+        ))
+        add(self._best_matching(eligible, lambda r: "TRAM" in r.get("transitModes", [])))
+        add(self._best_matching(eligible, lambda r: "RAIL" in r.get("transitModes", [])))
+
+        # Direct bicycle remains visible as a useful baseline even when it is
+        # outside the normal soft time window.
         add(self._best_matching(routes, lambda r: r.get("kind") == "bike"), force=True)
 
         for route in routes:
@@ -1033,7 +1419,6 @@ class RoutePlanner:
             if len(selected) >= limit:
                 break
 
-        # Stable display: best recommendation first, then ascending score.
         selected.sort(key=lambda r: (r["score"], r["doorToDoor"]))
         for index, route in enumerate(selected):
             route["id"] = f"route-{index}"

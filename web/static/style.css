@@ -121,3 +121,51 @@ label,.profile-label{color:#4d535d;font-size:12px;font-weight:650}
 .profile-option-top strong{font-size:12px}
 .profile-option-top>span{color:#4e5660;font-size:11px;font-weight:700;white-space:nowrap}
 .profile-option-description{display:block;margin-top:4px;color:#777e88;font-size:10px;line-height:1.35}
+
+
+/* v0.5: adaptive route focus */
+.settings-divider{
+  height:1px;
+  margin:12px -12px;
+  background:#eceef1
+}
+.route-focus-control{margin-top:10px}
+.route-focus-control input[type="range"]{
+  width:100%;
+  accent-color:#16191d;
+  cursor:pointer
+}
+.route-focus-scale{
+  display:flex;
+  justify-content:space-between;
+  margin-top:2px;
+  color:#9298a1;
+  font-size:9px;
+  font-weight:650
+}
+.route-focus-card{
+  display:grid;
+  gap:3px;
+  margin-top:9px;
+  padding:9px 10px;
+  border:1px solid #e4e6ea;
+  border-radius:10px;
+  background:#f8f9fa
+}
+.route-focus-card strong{
+  color:#25292f;
+  font-size:11px
+}
+.route-focus-card span{
+  color:#747b85;
+  font-size:10px;
+  line-height:1.4
+}
+
+.control-hint{
+  display:block;
+  margin-top:3px;
+  color:#9298a1;
+  font-size:9px;
+  line-height:1.25
+}

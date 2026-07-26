@@ -2,6 +2,7 @@ const state = {
   origin: null,
   destination: null,
   profile: "balanced",
+  routeFocus: 0,
   picking: "origin",
   routes: [],
   selectedRouteId: null,
@@ -137,9 +138,46 @@ const PROFILE_UI = {
   calm: { label: "Спокойно", speed: 8.5 },
 };
 
+const ROUTE_FOCUS_UI = {
+  "-2": {
+    name: "Больше транспорта",
+    short: "больше ОТ",
+    description: "Стараться основную дистанцию проезжать на ОТ. Велосипед — преимущественно для подхода и последней части пути.",
+  },
+  "-1": {
+    name: "Скорее транспорт",
+    short: "скорее ОТ",
+    description: "Небольшой приоритет общественного транспорта, но быстрые велосипедные связки сохраняются.",
+  },
+  "0": {
+    name: "Баланс",
+    short: "баланс",
+    description: "Время остаётся главным фактором, но алгоритм старается сохранять разумную долю велосипеда.",
+  },
+  "1": {
+    name: "Больше велосипеда",
+    short: "больше вело",
+    description: "Допускается умеренный проигрыш по времени ради более длинных и цельных велосипедных участков.",
+  },
+  "2": {
+    name: "Велопрогулка",
+    short: "велопрогулка",
+    description: "Велосипед становится частью цели поездки. Алгоритм готов принять заметный, но ограниченный проигрыш по времени.",
+  },
+};
+
 function updateProfileSummary() {
   const profile = PROFILE_UI[state.profile] || PROFILE_UI.balanced;
-  $("profile-summary").textContent = `${profile.label} · ~${profile.speed} км/ч средняя`;
+  const focus = ROUTE_FOCUS_UI[String(state.routeFocus)] || ROUTE_FOCUS_UI["0"];
+  $("profile-summary").textContent =
+    `${profile.label} · ~${profile.speed} км/ч · маршрут: ${focus.short}`;
+}
+
+function updateRouteFocusUI() {
+  const focus = ROUTE_FOCUS_UI[String(state.routeFocus)] || ROUTE_FOCUS_UI["0"];
+  $("route-focus-name").textContent = focus.name;
+  $("route-focus-description").textContent = focus.description;
+  updateProfileSummary();
 }
 
 document.querySelectorAll("#profile-selector button").forEach((button) => {
@@ -150,6 +188,11 @@ document.querySelectorAll("#profile-selector button").forEach((button) => {
     });
     updateProfileSummary();
   });
+});
+
+$("route-focus").addEventListener("input", (event) => {
+  state.routeFocus = Number(event.target.value);
+  updateRouteFocusUI();
 });
 
 $("settings-button").addEventListener("click", () => {
@@ -255,6 +298,7 @@ async function calculateRoutes() {
         destination: state.destination,
         departureTime: $("departure").value,
         profile: state.profile,
+        routeFocus: state.routeFocus,
         maxTransfers: Number($("max-transfers").value),
         deepSearch: true,
       }),
@@ -274,8 +318,12 @@ async function calculateRoutes() {
       const anchors = stats.anchorCandidates ?? 0;
       const optimized = stats.transitOptimizedCandidates ?? 0;
       const comparisons = stats.bikeComparisons ?? 0;
+      const transferFiltered = stats.transferFiltered ?? 0;
+      const focusName = stats.routeFocusName || "Баланс";
       const elapsed = stats.elapsedMs ? ` · ${(stats.elapsedMs / 1000).toFixed(1)} с` : "";
-      $("results-summary").textContent = `${state.routes.length} из ${candidates} · ОТ→вело ${optimized} · сравнений ${comparisons} · anchors ${anchors}${elapsed}`;
+      const transferInfo = transferFiltered ? ` · отсечено по пересадкам ${transferFiltered}` : "";
+      $("results-summary").textContent =
+        `${state.routes.length} из ${candidates} · ${focusName} · ОТ→вело ${optimized} · anchors ${anchors}${transferInfo}${elapsed}`;
       if (stats.deepSearchError) {
         showDeepSearchWarning(stats.deepSearchError);
       }
@@ -357,6 +405,11 @@ function renderRoutes() {
       ? `<span class="badge optimized">🚲 заменено: ${optimization.replacedWalkLegs || 0} пеш. + ${optimization.replacedTransitCount || 0} ОТ</span>`
       : "";
 
+    const bikeShare = Math.round((Number(route.bikeShare) || 0) * 100);
+    const shareBadge = route.kind === "mixed"
+      ? `<span class="badge">🚲 ${bikeShare}% пути</span>`
+      : "";
+
     card.innerHTML = `
       <div class="route-top">
         <div>
@@ -371,6 +424,7 @@ function renderRoutes() {
         ${transitBadge}
         ${anchorBadge}
         ${optimizationBadge}
+        ${shareBadge}
         ${route.transfers ? `<span class="badge">${route.transfers} перес.</span>` : ""}
       </div>
 
@@ -577,7 +631,7 @@ async function checkOtp() {
 }
 
 initMoscowTime();
-updateProfileSummary();
+updateRouteFocusUI();
 setPicking("origin");
 updateSummary();
 checkOtp();

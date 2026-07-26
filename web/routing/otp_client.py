@@ -33,9 +33,11 @@ query Plan(
         duration start end generalizedCost numberOfTransfers waitingTime walkDistance
         legs {
           mode transitLeg duration distance startTime endTime realTime
+          interlineWithPreviousLeg
           from { name lat lon }
           to { name lat lon }
           route { shortName longName mode }
+          trip { gtfsId }
           legGeometry { length points }
         }
       }

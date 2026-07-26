@@ -153,6 +153,7 @@ class GtfsIndex:
         origin: tuple[float, float],
         destination: tuple[float, float],
         limit: int = 8,
+        route_focus: int = 0,
     ) -> list[Anchor]:
         self.ensure_loaded()
         if not self._loaded:
@@ -162,7 +163,22 @@ class GtfsIndex:
         if direct_m < 4_000:
             return []
 
-        max_egress_m = min(9_000.0, max(4_000.0, direct_m * 0.65))
+        route_focus = min(2, max(-2, int(route_focus)))
+        max_fraction = {
+            -2: 0.48,
+            -1: 0.58,
+            0: 0.68,
+            1: 0.78,
+            2: 0.88,
+        }[route_focus]
+        max_cap = {
+            -2: 7_000.0,
+            -1: 8_500.0,
+            0: 10_000.0,
+            1: 12_000.0,
+            2: 14_000.0,
+        }[route_focus]
+        max_egress_m = min(max_cap, max(4_000.0, direct_m * max_fraction))
         candidates: list[Anchor] = []
 
         for stop in self._stops:
@@ -178,9 +194,17 @@ class GtfsIndex:
             projection, corridor_m = project_to_segment(
                 origin[0], origin[1], destination[0], destination[1], stop.lat, stop.lon
             )
-            # We are looking for "transport first, bike later", so anchors should
-            # generally be in the latter ~65% of the journey.
-            if projection < 0.35 or projection > 1.15:
+            # Route focus changes how early we are willing to leave transit.
+            # "Велопрогулка" can exit much earlier, while a transport-heavy route
+            # keeps the anchor closer to the destination.
+            min_projection = {
+                -2: 0.52,
+                -1: 0.44,
+                0: 0.36,
+                1: 0.29,
+                2: 0.22,
+            }[route_focus]
+            if projection < min_projection or projection > 1.15:
                 continue
             if corridor_m > 5_000:
                 continue
@@ -188,10 +212,16 @@ class GtfsIndex:
             transport_value = math.log1p(stop.route_count) * 2.1
             mode_bonus = 0.7 * len(set(stop.modes).intersection({"BUS", "TRAM", "RAIL"}))
             corridor_bonus = max(0.0, 2.5 * (1.0 - corridor_m / 5_000.0))
-            # Slight preference for 2-6 km bicycle egress: far enough to create
-            # a genuinely different route, but not so far that transit is pointless.
-            target = 4_000.0
-            egress_bonus = max(0.0, 2.0 - abs(d_dest - target) / 2_500.0)
+            # The preferred egress length moves with route focus. This affects
+            # candidate generation itself, not just the final score.
+            target = {
+                -2: 2_000.0,
+                -1: 3_000.0,
+                0: 4_500.0,
+                1: 6_000.0,
+                2: 8_000.0,
+            }[route_focus]
+            egress_bonus = max(0.0, 2.4 - abs(d_dest - target) / 2_800.0)
 
             candidates.append(
                 Anchor(
@@ -209,7 +239,13 @@ class GtfsIndex:
 
         # Preserve several egress-distance scales instead of taking only the globally
         # highest scoring central interchange stops.
-        bands = ((1_000, 2_500), (2_500, 4_500), (4_500, 6_500), (6_500, 9_001))
+        bands = (
+            (1_000, 2_500),
+            (2_500, 4_500),
+            (4_500, 7_000),
+            (7_000, 10_000),
+            (10_000, 14_001),
+        )
         selected: list[Anchor] = []
         per_band = max(1, math.ceil(limit / len(bands)))
 
