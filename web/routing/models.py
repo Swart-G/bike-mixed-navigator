@@ -50,7 +50,7 @@ ROUTE_FOCUS_CONFIG = {
     -2: {
         "key": "transit",
         "name": "Больше транспорта",
-        "bike_share_shift": -0.32,
+        "bike_share_shift": -0.20,
         "share_penalty_seconds": 1500,
         "transfer_penalty_factor": 0.70,
         "time_tolerance_ratio": 0.30,
@@ -59,7 +59,7 @@ ROUTE_FOCUS_CONFIG = {
     -1: {
         "key": "transit_lean",
         "name": "Скорее транспорт",
-        "bike_share_shift": -0.16,
+        "bike_share_shift": -0.10,
         "share_penalty_seconds": 1200,
         "transfer_penalty_factor": 0.85,
         "time_tolerance_ratio": 0.25,
@@ -77,7 +77,7 @@ ROUTE_FOCUS_CONFIG = {
     1: {
         "key": "bike_lean",
         "name": "Больше велосипеда",
-        "bike_share_shift": 0.20,
+        "bike_share_shift": 0.15,
         "share_penalty_seconds": 1200,
         "transfer_penalty_factor": 1.15,
         "time_tolerance_ratio": 0.38,
@@ -86,7 +86,7 @@ ROUTE_FOCUS_CONFIG = {
     2: {
         "key": "ride",
         "name": "Велопрогулка",
-        "bike_share_shift": 0.42,
+        "bike_share_shift": 0.30,
         "share_penalty_seconds": 1500,
         "transfer_penalty_factor": 1.30,
         "time_tolerance_ratio": 0.55,

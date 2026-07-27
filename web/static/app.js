@@ -315,15 +315,16 @@ async function calculateRoutes() {
       selectRoute(state.routes[0].id);
       const stats = data.stats || {};
       const candidates = stats.candidatesTotal ?? state.routes.length;
-      const anchors = stats.anchorCandidates ?? 0;
+      const boardingAnchors = stats.boardingAnchorCandidates ?? 0;
+      const egressAnchors = stats.egressAnchorCandidates ?? stats.anchorCandidates ?? 0;
       const optimized = stats.transitOptimizedCandidates ?? 0;
-      const comparisons = stats.bikeComparisons ?? 0;
+      const pareto = stats.paretoCandidates ?? candidates;
       const transferFiltered = stats.transferFiltered ?? 0;
       const focusName = stats.routeFocusName || "Баланс";
       const elapsed = stats.elapsedMs ? ` · ${(stats.elapsedMs / 1000).toFixed(1)} с` : "";
       const transferInfo = transferFiltered ? ` · отсечено по пересадкам ${transferFiltered}` : "";
       $("results-summary").textContent =
-        `${state.routes.length} из ${candidates} · ${focusName} · ОТ→вело ${optimized} · anchors ${anchors}${transferInfo}${elapsed}`;
+        `${state.routes.length} из ${candidates} · ${focusName} · Pareto ${pareto} · ОТ→вело ${optimized} · вход ${boardingAnchors} / выход ${egressAnchors}${transferInfo}${elapsed}`;
       if (stats.deepSearchError) {
         showDeepSearchWarning(stats.deepSearchError);
       }
@@ -396,8 +397,22 @@ function renderRoutes() {
       ? `<span class="badge">${escapeHtml(transitNames.join(" · "))}</span>`
       : `<span class="badge">🚲 ${(route.bikeDistance / 1000).toFixed(1)} км</span>`;
 
-    const anchorBadge = route.anchor
-      ? `<span class="badge anchor">выход: ${escapeHtml(route.anchor.name)} → 🚲 ${(route.anchor.bikeEgressDistance / 1000).toFixed(1)} км</span>`
+    let anchorBadge = "";
+    if (route.anchor?.type === "boarding") {
+      const km = (Number(route.anchor.bikeAccessDistance) || 0) / 1000;
+      anchorBadge = `<span class="badge anchor">🚲 ${km.toFixed(1)} км → посадка: ${escapeHtml(route.anchor.name)}</span>`;
+    } else if (route.anchor) {
+      const km = (Number(route.anchor.bikeEgressDistance) || 0) / 1000;
+      anchorBadge = `<span class="badge anchor">выход: ${escapeHtml(route.anchor.name)} → 🚲 ${km.toFixed(1)} км</span>`;
+    }
+
+    const explanations = Array.isArray(route.explanations)
+      ? route.explanations.slice(0, 3)
+      : [];
+    const explanationHtml = explanations.length
+      ? `<div class="route-explanations">${explanations
+          .map((text) => `<span class="explanation-chip">${escapeHtml(text)}</span>`)
+          .join("")}</div>`
       : "";
 
     const optimization = route.optimization || null;
@@ -428,6 +443,7 @@ function renderRoutes() {
         ${route.transfers ? `<span class="badge">${route.transfers} перес.</span>` : ""}
       </div>
 
+      ${explanationHtml}
       <div class="legs">${route.legs.map(renderLeg).join("")}</div>
     `;
 
