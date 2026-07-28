@@ -10,6 +10,8 @@ from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 
+from .models import ROUTE_FOCUS_CONFIG
+
 
 ROUTE_TYPE_TO_MODE = {
     "0": "TRAM",
@@ -18,7 +20,7 @@ ROUTE_TYPE_TO_MODE = {
     "3": "BUS",
     "11": "TROLLEYBUS",
 }
-SUPPORTED_MODES = {"BUS", "TRAM", "TROLLEYBUS", "RAIL"}
+SUPPORTED_MODES = {"BUS", "TRAM", "TROLLEYBUS", "RAIL", "SUBWAY"}
 
 
 @dataclass(frozen=True)
@@ -444,42 +446,23 @@ class GtfsIndex:
             return []
 
         route_focus = min(2, max(-2, int(route_focus)))
+        focus = ROUTE_FOCUS_CONFIG[route_focus]
         if role == "boarding":
             max_anchor_m = min(
-                {
-                    -2: 2_400.0,
-                    -1: 3_000.0,
-                    0: 3_800.0,
-                    1: 5_000.0,
-                    2: 6_500.0,
-                }[route_focus],
+                focus.max_bike_access_m,
                 max(1_800.0, direct_m * 0.38),
             )
-            target_distance = {
-                -2: 900.0,
-                -1: 1_300.0,
-                0: 1_900.0,
-                1: 2_700.0,
-                2: 3_800.0,
-            }[route_focus]
+            target_distance = focus.access_target_m
         else:
             max_anchor_m = min(
-                {
-                    -2: 6_000.0,
-                    -1: 8_000.0,
-                    0: 10_000.0,
-                    1: 12_000.0,
-                    2: 14_000.0,
-                }[route_focus],
-                max(3_500.0, direct_m * { -2: 0.45, -1: 0.55, 0: 0.68, 1: 0.80, 2: 0.90 }[route_focus]),
+                focus.max_bike_egress_m,
+                max(
+                    3_500.0,
+                    direct_m
+                    * min(0.90, focus.max_bike_egress_m / max(1.0, direct_m)),
+                ),
             )
-            target_distance = {
-                -2: 1_800.0,
-                -1: 2_800.0,
-                0: 4_300.0,
-                1: 6_000.0,
-                2: 8_000.0,
-            }[route_focus]
+            target_distance = focus.egress_target_m
 
         candidates: list[Anchor] = []
         for stop in self._stops:
@@ -526,7 +509,9 @@ class GtfsIndex:
             line_quality = sum(top2) / len(top2) if top2 else 0.0
 
             route_value = min(2.2, math.log1p(stop.route_count) * 0.62)
-            mode_value = 0.30 * len(set(stop.modes).intersection({"BUS", "TRAM", "RAIL"}))
+            mode_value = 0.30 * len(
+                set(stop.modes).intersection({"BUS", "TRAM", "RAIL", "SUBWAY"})
+            )
             trunk_value = 4.2 * line_quality
             corridor_value = max(0.0, 1.8 * (1.0 - corridor_m / corridor_limit))
             distance_value = max(0.0, 1.6 - abs(endpoint_distance - target_distance) / max(900.0, target_distance))

@@ -8,11 +8,15 @@ from copy import deepcopy
 from datetime import datetime, timedelta
 from typing import Any, Callable
 
+from .diagnostics import RoutingDiagnostics
 from .gtfs_index import Anchor, GtfsIndex, LineMetrics
 from .models import (
+    BICYCLE_ROUTE_VARIANTS,
+    DEFAULT_PROFILE,
     MOSCOW_TZ,
     PROFILE_CONFIG,
     ROUTE_FOCUS_CONFIG,
+    RouteFocusConfig,
     decode_polyline,
     parse_coordinate,
     parse_departure,
@@ -23,14 +27,14 @@ from .models import (
 from .otp_client import OTPClient, coordinate_location, stop_location
 
 
-ALL_TRANSIT = ["BUS", "TRAM", "TROLLEYBUS", "RAIL"]
+ALL_TRANSIT = ["BUS", "TRAM", "TROLLEYBUS", "RAIL", "SUBWAY"]
 MODE_QUERIES = {
     "bus": ["BUS", "TROLLEYBUS"],
     "tram": ["TRAM"],
-    "rail": ["RAIL"],
+    "rail": ["RAIL", "SUBWAY"],
     "bus_tram": ["BUS", "TROLLEYBUS", "TRAM"],
-    "bus_rail": ["BUS", "TROLLEYBUS", "RAIL"],
-    "tram_rail": ["TRAM", "RAIL"],
+    "bus_rail": ["BUS", "TROLLEYBUS", "RAIL", "SUBWAY"],
+    "tram_rail": ["TRAM", "RAIL", "SUBWAY"],
 }
 SOFT_ROUTING_ERRORS = {
     "NO_STOPS_IN_RANGE",
@@ -38,6 +42,11 @@ SOFT_ROUTING_ERRORS = {
     "NO_TRANSIT_CONNECTION",
     "NO_TRANSIT_CONNECTION_IN_SEARCH_WINDOW",
 }
+INTERNAL_MAX_TRANSIT_TRANSFERS = 4
+
+
+class RouteEditConflict(ValueError):
+    """A manual edit is valid geometrically but breaks a scheduled connection."""
 
 
 class RoutePlanner:
@@ -86,12 +95,20 @@ class RoutePlanner:
         destination = parse_coordinate(payload.get("destination"), "Финиш")
         departure = parse_departure(payload.get("departureTime"))
 
-        profile = str(payload.get("profile") or "balanced")
-        if profile not in PROFILE_CONFIG:
-            profile = "balanced"
-        max_transfers = self._clamp_int(payload.get("maxTransfers", 2), 2, 5, 2)
-        route_focus = self._clamp_int(payload.get("routeFocus", 0), -2, 2, 0)
+        # `profile` remains accepted for API compatibility but no longer changes
+        # routing behaviour.  Several bicycle street strategies are generated
+        # together below.
+        requested_profile = payload.get("profile")
+        profile = DEFAULT_PROFILE
+        requested_max_transfers = payload.get("maxTransfers")
+        requested_route_focus = payload.get("routeFocus")
+        max_transfers = INTERNAL_MAX_TRANSIT_TRANSFERS
+        # Journey settings were removed from the product. Focus remains an
+        # internal candidate-family axis and AUTO (0) deliberately generates
+        # conservative, balanced and bicycle-heavy optimization variants.
+        route_focus = 0
         deep_search = bool(payload.get("deepSearch", True))
+        diagnostics = RoutingDiagnostics(enabled=bool(payload.get("debugRouting", False)))
         focus_cfg = ROUTE_FOCUS_CONFIG[route_focus]
 
         # Warm the line/stop metrics once. If GTFS indexing fails, all routing
@@ -99,9 +116,17 @@ class RoutePlanner:
         self.gtfs.ensure_loaded()
 
         generic_routes, warnings, generic_stats = self._generic_candidates(
-            origin, destination, departure, profile, max_transfers
+            origin, destination, departure, profile, max_transfers, route_focus
         )
-        direct_bike = self._best_matching(generic_routes, lambda r: r.get("kind") == "bike")
+        direct_bikes = [r for r in generic_routes if r.get("kind") == "bike"]
+        for family, count in generic_stats["families"].items():
+            diagnostics.generated_candidates(family, count)
+        for route in generic_routes:
+            diagnostics.event(
+                "candidate_generated",
+                route,
+                family=str(route.get("sourceQuery") or "generic"),
+            )
 
         transit_routes, transit_warnings, transit_stats = self._transit_first_candidates(
             origin,
@@ -110,18 +135,23 @@ class RoutePlanner:
             profile,
             max_transfers,
             route_focus,
+            seed_skeletons=[r for r in generic_routes if r.get("kind") == "mixed"],
+            diagnostics=diagnostics,
         )
         warnings.extend(transit_warnings)
+        diagnostics.generated_candidates("transitOptimized", len(transit_routes), transit_routes)
 
         boarding_anchors: list[Anchor] = []
         egress_anchors: list[Anchor] = []
         boarding_routes: list[dict[str, Any]] = []
         egress_routes: list[dict[str, Any]] = []
+        anchor_bike_comparisons = 0
+        trunk_searches = 0
         deep_error: str | None = None
 
         if deep_search and self.gtfs.loaded:
             try:
-                anchor_limit = int(focus_cfg["anchor_limit"])
+                anchor_limit = int(focus_cfg.anchor_limit)
                 boarding_anchors = self.gtfs.boarding_anchors(
                     origin,
                     destination,
@@ -134,6 +164,13 @@ class RoutePlanner:
                     limit=max(6, anchor_limit - 2),
                     route_focus=route_focus,
                 )
+                trunk_searches = sum(
+                    1
+                    for anchor in boarding_anchors + egress_anchors
+                    if anchor.best_trunk_score >= 0.58
+                    or set(anchor.modes).intersection({"RAIL", "SUBWAY", "TRAM"})
+                )
+                diagnostics.generated_candidates("trunkSearches", trunk_searches)
                 boarding_routes, egress_routes = self._anchor_candidates(
                     boarding_anchors=boarding_anchors,
                     egress_anchors=egress_anchors,
@@ -142,46 +179,77 @@ class RoutePlanner:
                     departure=departure,
                     profile=profile,
                     max_transfers=max_transfers,
+                    route_focus=route_focus,
                 )
+                diagnostics.generated_candidates(
+                    "boardingAnchorRaw",
+                    len(boarding_routes),
+                    boarding_routes,
+                )
+                diagnostics.generated_candidates(
+                    "egressAnchorRaw",
+                    len(egress_routes),
+                    egress_routes,
+                )
+                boarding_routes, boarding_comparisons = self._optimize_candidate_set(
+                    boarding_routes,
+                    requested_departure=departure,
+                    profile=profile,
+                    route_focus=route_focus,
+                    diagnostics=diagnostics,
+                )
+                egress_routes, egress_comparisons = self._optimize_candidate_set(
+                    egress_routes,
+                    requested_departure=departure,
+                    profile=profile,
+                    route_focus=route_focus,
+                    diagnostics=diagnostics,
+                )
+                anchor_bike_comparisons = boarding_comparisons + egress_comparisons
             except Exception as exc:
                 deep_error = str(exc)
+        diagnostics.generated_candidates("boardingAnchors", len(boarding_routes), boarding_routes)
+        diagnostics.generated_candidates("egressAnchors", len(egress_routes), egress_routes)
 
-        # Raw BIKE+TRANSIT OTP candidates are a fallback only. Once our
-        # transit-first/anchor pipelines produce routes, keeping raw candidates
-        # tends to reintroduce weak local buses and near-clones.
-        fallback_mixed = []
-        if not transit_routes and not boarding_routes and not egress_routes:
-            fallback_mixed = [r for r in generic_routes if r.get("kind") == "mixed"]
-
-        pool = [r for r in [direct_bike] if r is not None]
+        pool = list(direct_bikes)
         pool.extend(transit_routes)
         pool.extend(boarding_routes)
         pool.extend(egress_routes)
-        pool.extend(fallback_mixed)
+        raw_pool_count = len(pool)
         pool = self._dedupe_exact(pool)
+        deduped_pool_count = len(pool)
 
-        before_policy_filter = len(pool)
-        policy_legal_pool = [route for route in pool if self._bike_carriage_is_legal(route)]
-        bike_policy_filtered = before_policy_filter - len(policy_legal_pool)
-
-        before_transfer_filter = len(policy_legal_pool)
         normalized_pool: list[dict[str, Any]] = []
-        for route in policy_legal_pool:
+        bike_policy_filtered = 0
+        transfer_filtered = 0
+        for route in pool:
+            if not self._candidate_is_valid(route):
+                diagnostics.reject("invalid", route)
+                continue
+            if not self._bike_carriage_is_legal(route):
+                bike_policy_filtered += 1
+                diagnostics.reject("bikePolicy", route)
+                continue
             route = self._score_route(route, profile)
-            if int(route.get("transfers") or 0) <= max_transfers:
-                normalized_pool.append(route)
-        transfer_filtered = before_transfer_filter - len(normalized_pool)
+            normalized_pool.append(route)
 
         focused = self._apply_route_focus(
             normalized_pool,
             profile_key=profile,
             route_focus=route_focus,
         )
-        pareto = self._pareto_prune(focused)
+        focused = self._classify_strategies(focused, route_focus=route_focus)
+        diagnostics.count_strategies(focused)
+        pareto = self._pareto_prune(
+            focused,
+            route_focus=route_focus,
+            diagnostics=diagnostics,
+        )
         selected = self._select_diverse(
             pareto,
-            limit=6,
+            limit=14,
             route_focus=route_focus,
+            diagnostics=diagnostics,
         )
         self._assign_recommendation_labels(selected)
         self._add_explanations(selected)
@@ -189,35 +257,220 @@ class RoutePlanner:
         if selected:
             warnings = [w for w in warnings if w.get("code") not in SOFT_ROUTING_ERRORS]
 
-        return {
+        stats = {
+            "algorithm": "hybrid-strategy-v0.6",
+            "routingPipelineVersion": 7,
+            "genericQueries": generic_stats["queries"],
+            "genericCandidates": len(generic_routes),
+            "transitSkeletonQueries": transit_stats["queries"],
+            "transitSkeletons": transit_stats["skeletons"],
+            "transitOptimizedCandidates": len(transit_routes),
+            "optimizerFocusVariants": list(focus_cfg.optimizer_focus_variants),
+            "bikeComparisons": transit_stats["bikeComparisons"],
+            "anchorBikeComparisons": anchor_bike_comparisons,
+            "boardingAnchorsConsidered": len(boarding_anchors),
+            "boardingAnchorCandidates": len(boarding_routes),
+            "egressAnchorsConsidered": len(egress_anchors),
+            "anchorCandidates": len(egress_routes),  # backwards-compatible UI field
+            "egressAnchorCandidates": len(egress_routes),
+            "trunkSearches": trunk_searches,
+            "candidatesBeforePareto": len(focused),
+            "paretoCandidates": len(pareto),
+            "candidatesTotal": len(focused),
+            "candidateStages": {
+                "rawPool": raw_pool_count,
+                "afterExactDedupe": deduped_pool_count,
+                "scored": len(normalized_pool),
+                "afterPareto": len(pareto),
+                "returned": len(selected),
+            },
+            "transferFiltered": transfer_filtered,
+            "bikePolicyFiltered": bike_policy_filtered,
+            "maxTransfers": max_transfers,
+            "transferSettingIgnored": requested_max_transfers is not None,
+            "routeFocus": route_focus,
+            "routeFocusName": focus_cfg.name,
+            "routeFocusIgnored": requested_route_focus is not None,
+            "routeFocusGeneration": {
+                "maxBikeAccessM": focus_cfg.max_bike_access_m,
+                "maxBikeEgressM": focus_cfg.max_bike_egress_m,
+                "anchorLimit": focus_cfg.anchor_limit,
+                "modeFamilies": list(focus_cfg.generic_mode_families),
+                "departureOffsetsMin": list(
+                    focus_cfg.transit_departure_offsets_min
+                ),
+                "transferCaps": list(focus_cfg.transit_transfer_caps),
+                "optimizerFocusVariants": list(
+                    focus_cfg.optimizer_focus_variants
+                ),
+            },
+            "profileIgnored": requested_profile is not None,
+            "bicycleStrategies": [item["key"] for item in BICYCLE_ROUTE_VARIANTS],
+            "returned": len(selected),
+            "deepSearchAvailable": self.gtfs.loaded,
+            "deepSearchError": deep_error or self.gtfs.error,
+            "pipeline": diagnostics.stats(),
+            "elapsedMs": round((time.monotonic() - started) * 1000),
+        }
+        result = {
             "routes": selected,
             "warnings": self._dedupe_warnings(warnings),
-            "stats": {
-                "algorithm": "hybrid-strategy-v0.6",
-                "genericQueries": generic_stats["queries"],
-                "genericCandidates": len(generic_routes),
-                "transitSkeletonQueries": transit_stats["queries"],
-                "transitSkeletons": transit_stats["skeletons"],
-                "transitOptimizedCandidates": len(transit_routes),
-                "bikeComparisons": transit_stats["bikeComparisons"],
-                "boardingAnchorsConsidered": len(boarding_anchors),
-                "boardingAnchorCandidates": len(boarding_routes),
-                "egressAnchorsConsidered": len(egress_anchors),
-                "anchorCandidates": len(egress_routes),  # backwards-compatible UI field
-                "egressAnchorCandidates": len(egress_routes),
-                "candidatesBeforePareto": len(focused),
-                "paretoCandidates": len(pareto),
-                "candidatesTotal": len(focused),
-                "transferFiltered": transfer_filtered,
-                "bikePolicyFiltered": bike_policy_filtered,
-                "maxTransfers": max_transfers,
-                "routeFocus": route_focus,
-                "routeFocusName": focus_cfg["name"],
-                "returned": len(selected),
-                "deepSearchAvailable": self.gtfs.loaded,
-                "deepSearchError": deep_error or self.gtfs.error,
-                "elapsedMs": round((time.monotonic() - started) * 1000),
-            },
+            "stats": stats,
+        }
+        if diagnostics.enabled:
+            result["debugTrace"] = diagnostics.trace()
+        return result
+
+    def replace_with_bicycle(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Replace a contiguous range of route legs with one OTP bicycle route.
+
+        Boundaries are indexes between legs: ``0`` is the route origin and
+        ``len(legs)`` is the destination. Remaining scheduled transit keeps its
+        original departure. The edit is rejected when the new bicycle segment
+        can no longer catch one of those departures.
+        """
+
+        source = payload.get("route")
+        if not isinstance(source, dict):
+            raise ValueError("Для изменения нужен исходный маршрут.")
+        route = deepcopy(source)
+        legs = route.get("legs")
+        if not isinstance(legs, list) or not legs:
+            raise ValueError("В исходном маршруте нет участков.")
+        if len(legs) > 80:
+            raise ValueError("В маршруте слишком много участков для ручного изменения.")
+        if any(
+            str(leg.get("mode") or "").upper() in {"CAR", "MOTORCYCLE"}
+            for leg in legs
+            if isinstance(leg, dict)
+        ):
+            raise ValueError("Автомобильные участки нельзя использовать в веломаршруте.")
+
+        try:
+            start_boundary = int(payload.get("startBoundary"))
+            end_boundary = int(payload.get("endBoundary"))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Некорректные границы велосипедной замены.") from exc
+        if not 0 <= start_boundary < end_boundary <= len(legs):
+            raise ValueError("Начало замены должно находиться раньше её конца.")
+
+        requested_departure = parse_departure(
+            payload.get("departureTime") or route.get("start")
+        )
+        start_point = self._route_boundary(legs, start_boundary)
+        end_point = self._route_boundary(legs, end_boundary)
+        if start_point is None or end_point is None:
+            raise ValueError("Не удалось определить координаты выбранных точек.")
+
+        segment_departure = (
+            self._parse_leg_timestamp((legs[start_boundary] or {}).get("startTime"))
+            or requested_departure
+        )
+        bicycle = self._bike_between_points(
+            (start_point["lat"], start_point["lon"]),
+            (end_point["lat"], end_point["lon"]),
+            segment_departure,
+            DEFAULT_PROFILE,
+        )
+        if bicycle is None:
+            raise ValueError("OTP не смог построить велосипедный путь между этими точками.")
+        bicycle_legs = [
+            deepcopy(leg)
+            for leg in bicycle.get("legs") or []
+            if leg.get("mode") == "BICYCLE" and not leg.get("transitLeg")
+        ]
+        if not bicycle_legs or len(bicycle_legs) != len(bicycle.get("legs") or []):
+            raise ValueError("Велосипедная замена содержит недопустимый тип дороги.")
+
+        bicycle_legs[0]["from"] = deepcopy(start_point["place"])
+        bicycle_legs[-1]["to"] = deepcopy(end_point["place"])
+        edit_record = {
+            "startBoundary": start_boundary,
+            "endBoundary": end_boundary,
+            "from": start_point["place"].get("name") or "Начало",
+            "to": end_point["place"].get("name") or "Конец",
+            "replacedLegs": end_boundary - start_boundary,
+            "bikeDistance": round(
+                sum(float(leg.get("distance") or 0) for leg in bicycle_legs),
+                1,
+            ),
+            "bikeDuration": sum(int(leg.get("duration") or 0) for leg in bicycle_legs),
+        }
+        for leg in bicycle_legs:
+            leg["manualReplacement"] = deepcopy(edit_record)
+
+        combined = (
+            deepcopy(legs[:start_boundary])
+            + bicycle_legs
+            + deepcopy(legs[end_boundary:])
+        )
+        for leg in combined:
+            if not leg.get("transitLeg"):
+                continue
+            fixed_start = leg.get("_fixedTransitStart") or leg.get("startTime")
+            fixed_end = leg.get("_fixedTransitEnd") or leg.get("endTime")
+            if fixed_start:
+                leg["_fixedTransitStart"] = fixed_start
+            if fixed_end:
+                leg["_fixedTransitEnd"] = fixed_end
+
+        if any(leg.get("transitLeg") for leg in combined):
+            rebuilt = self._rebuild_schedule(
+                combined,
+                requested_departure=requested_departure,
+            )
+            if rebuilt is None:
+                raise RouteEditConflict(
+                    "Велосипедная замена не успевает на следующий рейс. "
+                    "Выберите конец после этой пересадки или другой диапазон."
+                )
+            route_start, route_end, waiting_time, scheduled = rebuilt
+        else:
+            route_start = requested_departure
+            route_end, scheduled = self._schedule_street_legs(
+                combined,
+                route_start=route_start,
+            )
+            waiting_time = 0
+
+        route["id"] = str(route.get("id") or "")
+        route["kind"] = (
+            "mixed"
+            if any(leg.get("transitLeg") for leg in scheduled)
+            else "bike"
+        )
+        route["strategy"] = "manual_bicycle_edit"
+        route["sourceQuery"] = "manual_bicycle_edit"
+        route["streetPreference"] = "cycleway"
+        route["start"] = route_start.isoformat()
+        route["end"] = route_end.isoformat()
+        route["initialWait"] = max(
+            0,
+            int((route_start - requested_departure).total_seconds()),
+        )
+        route["duration"] = max(0, int((route_end - route_start).total_seconds()))
+        route["doorToDoor"] = max(
+            0,
+            int((route_end - requested_departure).total_seconds()),
+        )
+        route["waitingTime"] = waiting_time
+        route["legs"] = scheduled
+        route["manualEdits"] = (
+            list(route.get("manualEdits") or [])[-19:] + [edit_record]
+        )
+        route["anchor"] = None
+        route["generalizedCost"] = None
+
+        route = self._score_route(route, DEFAULT_PROFILE)
+        route = self._classify_strategies([route], route_focus=0)[0]
+        self._assign_recommendation_labels([route])
+        self._add_explanations([route])
+        route["explanations"] = [
+            f"Участок {edit_record['from']} → {edit_record['to']} заменён велосипедом"
+        ] + list(route.get("explanations") or [])[:2]
+        return {
+            "route": route,
+            "edit": edit_record,
         }
 
     # ------------------------------------------------------ candidate generation
@@ -229,38 +482,50 @@ class RoutePlanner:
         departure: datetime,
         selected_profile: str,
         max_transfers: int,
-    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, int]]:
-        specs = [
+        route_focus: int,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
+        focus = ROUTE_FOCUS_CONFIG[route_focus]
+        transfer_cap = max(0, max_transfers - focus.transfer_reduction)
+        specs: list[dict[str, Any]] = [
             {
-                "name": "main",
-                "profile": selected_profile,
-                "modes": ALL_TRANSIT,
+                "name": f"direct_{variant['key']}",
+                "profile": variant["otp_profile"],
                 "direct_bike": True,
-                "strategy": "generic",
-            },
-            {
-                "name": "profile_fast",
-                "profile": "fast",
-                "modes": ALL_TRANSIT,
-                "strategy": "generic_fast",
-            },
-            {
-                "name": "rail",
-                "profile": selected_profile,
-                "modes": MODE_QUERIES["rail"],
-                "strategy": "generic_rail",
-            },
-            {
-                "name": "bus_tram",
-                "profile": selected_profile,
-                "modes": MODE_QUERIES["bus_tram"],
-                "strategy": "generic_surface",
-            },
+                "direct_only": True,
+                "strategy": variant["strategy"],
+                "street_preference": variant["key"],
+            }
+            for variant in BICYCLE_ROUTE_VARIANTS
         ]
+        # Generate multimodal access with every bicycle street hypothesis. The
+        # old implementation varied only direct-bike routes, so moving focus
+        # could not change the actual access corridor found by OTP.
+        specs.extend(
+            {
+                "name": f"generic_{variant['key']}",
+                "profile": variant["otp_profile"],
+                "modes": ALL_TRANSIT,
+                "strategy": f"generic_multimodal_{variant['key']}",
+                "street_preference": variant["key"],
+            }
+            for variant in BICYCLE_ROUTE_VARIANTS
+        )
+        specs.extend(
+            {
+                "name": family,
+                "profile": selected_profile,
+                "modes": MODE_QUERIES[family],
+                "strategy": f"generic_{family}",
+                "street_preference": "cycleway",
+            }
+            for family in focus.generic_mode_families
+            if family != "all"
+        )
         origin_loc = coordinate_location(*origin, "Старт")
         destination_loc = coordinate_location(*destination, "Финиш")
         routes: list[dict[str, Any]] = []
         warnings: list[dict[str, Any]] = []
+        family_counts: dict[str, int] = {}
 
         def run(spec: dict[str, Any]):
             nodes, local_warnings = self.otp.plan(
@@ -268,11 +533,12 @@ class RoutePlanner:
                 destination=destination_loc,
                 departure=departure,
                 profile=spec["profile"],
-                transit_modes=spec["modes"],
-                max_transfers=max_transfers,
+                transit_modes=spec.get("modes"),
+                max_transfers=transfer_cap,
                 direct_bike=bool(spec.get("direct_bike")),
-                transit_only=not bool(spec.get("direct_bike")),
-                first=14,
+                direct_only=bool(spec.get("direct_only")),
+                transit_only=False,
+                first=focus.otp_candidates_per_query,
             )
             local_routes = [
                 self._normalize_route(
@@ -281,22 +547,28 @@ class RoutePlanner:
                     profile_key=selected_profile,
                     strategy=spec["strategy"],
                     source_query=spec["name"],
+                    street_preference=spec.get("street_preference"),
                 )
                 for node in nodes
             ]
-            return [r for r in local_routes if r.get("kind") != "other"], local_warnings
+            return spec["name"], [r for r in local_routes if r.get("kind") != "other"], local_warnings
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=self.generic_workers) as pool:
             futures = [pool.submit(run, spec) for spec in specs]
             for future in concurrent.futures.as_completed(futures):
                 try:
-                    local, local_warnings = future.result()
+                    family, local, local_warnings = future.result()
                     routes.extend(local)
                     warnings.extend(local_warnings)
+                    family_counts[family] = family_counts.get(family, 0) + len(local)
                 except Exception as exc:
                     warnings.append({"code": "CANDIDATE_QUERY_FAILED", "description": str(exc)})
 
-        return self._dedupe_exact(routes), self._dedupe_warnings(warnings), {"queries": len(specs)}
+        return (
+            self._dedupe_exact(routes),
+            self._dedupe_warnings(warnings),
+            {"queries": len(specs), "families": family_counts},
+        )
 
     def _transit_first_candidates(
         self,
@@ -306,36 +578,64 @@ class RoutePlanner:
         profile: str,
         max_transfers: int,
         route_focus: int,
-    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, int]]:
-        specs = [
-            ("pt_all", ALL_TRANSIT, max_transfers),
-            ("pt_bus", MODE_QUERIES["bus"], max_transfers),
-            ("pt_tram", MODE_QUERIES["tram"], max_transfers),
-            ("pt_rail", MODE_QUERIES["rail"], max_transfers),
-            ("pt_bus_tram", MODE_QUERIES["bus_tram"], max_transfers),
-            ("pt_bus_rail", MODE_QUERIES["bus_rail"], max_transfers),
-            ("pt_tram_rail", MODE_QUERIES["tram_rail"], max_transfers),
-            ("pt_simple", ALL_TRANSIT, 1),
-        ]
+        seed_skeletons: list[dict[str, Any]] | None = None,
+        diagnostics: RoutingDiagnostics | None = None,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
+        focus = ROUTE_FOCUS_CONFIG[route_focus]
+        # Always include full-transfer skeletons. Bike-heavy routing needs to
+        # see them before it can replace weak feeder/intermediate legs; reducing
+        # the transfer cap at this stage used to erase those opportunities.
+        specs: list[dict[str, Any]] = []
+        seen_specs: set[tuple[tuple[str, ...], int, int]] = set()
+
+        def add_spec(
+            name: str,
+            modes: list[str],
+            transfers: int,
+            offset_min: int = 0,
+        ) -> None:
+            key = (tuple(modes), min(max_transfers, transfers), offset_min)
+            if key in seen_specs:
+                return
+            seen_specs.add(key)
+            specs.append(
+                {
+                    "name": name,
+                    "modes": modes,
+                    "transfers": key[1],
+                    "offsetMin": offset_min,
+                }
+            )
+
+        for family in focus.generic_mode_families:
+            modes = ALL_TRANSIT if family == "all" else MODE_QUERIES[family]
+            add_spec(f"pt_{family}", modes, max_transfers)
+        for offset_min in focus.transit_departure_offsets_min:
+            for transfers in focus.transit_transfer_caps:
+                suffix = f"{offset_min}m_t{transfers}"
+                add_spec(f"pt_all_{suffix}", ALL_TRANSIT, transfers, offset_min)
         origin_loc = coordinate_location(*origin, "Старт")
         destination_loc = coordinate_location(*destination, "Финиш")
         skeletons: list[dict[str, Any]] = []
         warnings: list[dict[str, Any]] = []
 
-        def run(spec: tuple[str, list[str], int]):
-            name, modes, transfers = spec
+        def run(spec: dict[str, Any]):
+            name = str(spec["name"])
+            modes = list(spec["modes"])
+            transfers = int(spec["transfers"])
+            query_departure = departure + timedelta(minutes=int(spec["offsetMin"]))
             nodes, local_warnings = self.otp.plan(
                 origin=origin_loc,
                 destination=destination_loc,
-                departure=departure,
+                departure=query_departure,
                 profile=profile,
                 transit_modes=modes,
-                max_transfers=min(max_transfers, transfers),
+                max_transfers=transfers,
                 transit_only=True,
                 access_mode="WALK",
                 egress_mode="WALK",
                 transfer_mode="WALK",
-                first=14,
+                first=focus.otp_candidates_per_query,
             )
             local: list[dict[str, Any]] = []
             for node in nodes:
@@ -362,51 +662,82 @@ class RoutePlanner:
                         {"code": "TRANSIT_SKELETON_QUERY_FAILED", "description": str(exc)}
                     )
 
+        skeletons.extend(deepcopy(seed_skeletons or []))
+
         # Exact dedupe first, then retain different transport chains before the
         # expensive bicycle comparisons. Similarity is intentionally not used yet:
         # two skeletons on the same corridor can optimize into different strategies.
         skeletons = self._dedupe_exact(skeletons)
         preselected: list[dict[str, Any]] = []
-        chain_seen: set[tuple] = set()
-        for route in sorted(skeletons, key=lambda r: (r["doorToDoor"], r["score"])):
+        hypothesis_seen: set[tuple] = set()
+        chain_counts: dict[tuple, int] = {}
+        for route in sorted(
+            skeletons,
+            key=lambda r: (
+                self._candidate_generation_priority(r, route_focus),
+                r["doorToDoor"],
+            ),
+        ):
             chain = self._transit_chain_signature(route)
-            if chain in chain_seen:
+            transit_legs = [leg for leg in route.get("legs") or [] if leg.get("transitLeg")]
+            hypothesis = (
+                chain,
+                (transit_legs[0].get("from") or {}).get("name") if transit_legs else None,
+                (transit_legs[-1].get("to") or {}).get("name") if transit_legs else None,
+            )
+            if hypothesis in hypothesis_seen or chain_counts.get(chain, 0) >= 5:
                 continue
-            chain_seen.add(chain)
+            hypothesis_seen.add(hypothesis)
+            chain_counts[chain] = chain_counts.get(chain, 0) + 1
             preselected.append(route)
-            if len(preselected) >= 28:
+            if len(preselected) >= focus.transit_skeleton_limit:
                 break
 
         comparisons = 0
         counter_lock = threading.Lock()
         optimized: list[dict[str, Any]] = []
+        if diagnostics:
+            diagnostics.generated_candidates("transitSkeletons", len(preselected), preselected)
 
         def optimize(route: dict[str, Any]):
-            out, count = self._optimize_transit_skeleton(
-                route,
-                requested_departure=departure,
-                profile=profile,
-                route_focus=route_focus,
-            )
+            local_routes: list[dict[str, Any]] = []
+            count = 0
+            for optimizer_focus in focus.optimizer_focus_variants:
+                out, local_count = self._optimize_transit_skeleton(
+                    route,
+                    requested_departure=departure,
+                    profile=profile,
+                    route_focus=optimizer_focus,
+                )
+                count += local_count
+                if out is not None:
+                    out["optimizationFocus"] = optimizer_focus
+                    out.setdefault("optimization", {})["focusVariant"] = optimizer_focus
+                    local_routes.append(out)
             nonlocal comparisons
             with counter_lock:
                 comparisons += count
-            return out
+            if not local_routes and diagnostics:
+                diagnostics.reject("segmentOptimization", route)
+            return local_routes
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=self.generic_workers) as pool:
             futures = [pool.submit(optimize, route) for route in preselected]
             for future in concurrent.futures.as_completed(futures):
                 try:
-                    route = future.result()
-                    if route is not None:
-                        optimized.append(route)
+                    optimized.extend(future.result())
                 except Exception as exc:
                     warnings.append({"code": "TRANSIT_OPTIMIZER_FAILED", "description": str(exc)})
 
         return (
             self._dedupe_exact(optimized),
             self._dedupe_warnings(warnings),
-            {"queries": len(specs), "skeletons": len(preselected), "bikeComparisons": comparisons},
+            {
+                "queries": len(specs),
+                "skeletons": len(preselected),
+                "bikeComparisons": comparisons,
+                "optimizerRejected": max(0, len(preselected) - len(optimized)),
+            },
         )
 
     # ---------------------------------------------------------- segment optimizer
@@ -426,7 +757,10 @@ class RoutePlanner:
         choices: list[dict[str, Any]] = []
         replaced_walk = 0
         replaced_transit: list[dict[str, Any]] = []
-        previous_original_end = parse_otp_time(skeleton.get("start")) or requested_departure
+        transit_decisions: list[dict[str, Any]] = []
+        # The first boarding wait is part of door-to-door utility.  Initialising
+        # this cursor from itinerary.start used to make that wait disappear.
+        previous_original_end = requested_departure
 
         for index, leg in enumerate(original):
             mode = leg.get("mode") or "UNKNOWN"
@@ -452,6 +786,7 @@ class RoutePlanner:
                     wait_before=wait_before,
                     line=line,
                     route_focus=route_focus,
+                    profile=profile,
                 )
             )
 
@@ -471,6 +806,12 @@ class RoutePlanner:
                         "savedSeconds": max(0, duration - bike_duration),
                     }
                 elif is_transit:
+                    next_context = self._next_transit_context(
+                        original,
+                        index=index,
+                        previous_arrival=previous_original_end,
+                        replacement_duration=int(bike.get("duration") or 0),
+                    )
                     decision = self._transit_leg_replacement_decision(
                         leg=leg,
                         bike=bike,
@@ -478,8 +819,17 @@ class RoutePlanner:
                         line=line,
                         downstream_trunk_score=downstream_trunk,
                         route_focus=route_focus,
+                        **next_context,
                     )
                     replace = bool(decision.get("replace"))
+                    transit_decisions.append(
+                        {
+                            "mode": mode,
+                            "route": (leg.get("route") or {}).get("shortName")
+                            or (leg.get("route") or {}).get("longName"),
+                            **decision,
+                        }
+                    )
 
             if replace and bike is not None:
                 replacement_legs = deepcopy(bike.get("legs") or [])
@@ -509,6 +859,10 @@ class RoutePlanner:
                 if is_transit:
                     kept["_fixedTransitStart"] = leg_start.isoformat() if leg_start else None
                     kept["_fixedTransitEnd"] = leg_end.isoformat() if leg_end else None
+                    if decision:
+                        kept["transitUtility"] = {
+                            key: value for key, value in decision.items() if key != "replace"
+                        }
                 choices.append(kept)
 
             if leg_end is not None:
@@ -529,15 +883,29 @@ class RoutePlanner:
         if rebuilt is None:
             return None, comparisons
         route_start, route_end, waiting_total, scheduled_legs = rebuilt
+        rebuilt_door_to_door = max(
+            0,
+            int((route_end - requested_departure).total_seconds()),
+        )
+        actual_saved = max(
+            0,
+            int(skeleton.get("doorToDoor") or rebuilt_door_to_door)
+            - rebuilt_door_to_door,
+        )
 
         route = {
             "id": "",
             "kind": "mixed",
-            "strategy": "transit_optimized",
+            "strategy": (
+                skeleton.get("strategy")
+                if skeleton.get("strategy")
+                in {"boarding_anchor", "trunk_access", "egress_anchor"}
+                else "transit_optimized"
+            ),
             "sourceQuery": skeleton.get("sourceQuery", "transit_skeleton"),
             "duration": max(0, int((route_end - route_start).total_seconds())),
             "initialWait": max(0, int((route_start - requested_departure).total_seconds())),
-            "doorToDoor": max(0, int((route_end - requested_departure).total_seconds())),
+            "doorToDoor": rebuilt_door_to_door,
             "start": route_start.isoformat(),
             "end": route_end.isoformat(),
             "generalizedCost": None,
@@ -549,10 +917,64 @@ class RoutePlanner:
                 "replacedWalkLegs": replaced_walk,
                 "replacedTransitLegs": replaced_transit,
                 "replacedTransitCount": len(replaced_transit),
-                "savedSecondsEstimate": sum(x.get("savedSeconds", 0) for x in replaced_transit),
+                "savedSecondsEstimate": actual_saved,
+                "localUtilitySavingsSeconds": sum(
+                    x.get("savedSeconds", 0) for x in replaced_transit
+                ),
+                "transitLegDecisions": transit_decisions,
             },
         }
+        if skeleton.get("anchor"):
+            route["anchor"] = deepcopy(skeleton["anchor"])
+        if skeleton.get("candidateFamilies"):
+            route["candidateFamilies"] = list(skeleton["candidateFamilies"])
+        if skeleton.get("streetPreference"):
+            route["streetPreference"] = skeleton["streetPreference"]
         return self._score_route(route, profile), comparisons
+
+    def _optimize_candidate_set(
+        self,
+        routes: list[dict[str, Any]],
+        *,
+        requested_departure: datetime,
+        profile: str,
+        route_focus: int,
+        diagnostics: RoutingDiagnostics | None = None,
+    ) -> tuple[list[dict[str, Any]], int]:
+        if not routes:
+            return [], 0
+        result: list[dict[str, Any]] = []
+        comparisons = 0
+        lock = threading.Lock()
+
+        def optimize(candidate: dict[str, Any]) -> dict[str, Any] | None:
+            nonlocal comparisons
+            optimized, local_comparisons = self._optimize_transit_skeleton(
+                candidate,
+                requested_departure=requested_departure,
+                profile=profile,
+                route_focus=route_focus,
+            )
+            with lock:
+                comparisons += local_comparisons
+            if optimized is None and diagnostics:
+                diagnostics.reject("segmentOptimization", candidate)
+            return optimized
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=self.generic_workers) as pool:
+            futures = [pool.submit(optimize, route) for route in routes]
+            for future in concurrent.futures.as_completed(futures):
+                try:
+                    optimized = future.result()
+                    if optimized is not None:
+                        result.append(optimized)
+                except Exception as exc:
+                    if diagnostics:
+                        diagnostics.reject(
+                            "segmentOptimizationError",
+                            details=str(exc),
+                        )
+        return self._dedupe_exact(result), comparisons
 
     def _should_compare_transit_leg(
         self,
@@ -561,6 +983,7 @@ class RoutePlanner:
         wait_before: int,
         line: LineMetrics | None,
         route_focus: int,
+        profile: str = "balanced",
     ) -> bool:
         distance = float(leg.get("distance") or 0)
         duration = max(1, int(leg.get("duration") or 0))
@@ -568,26 +991,33 @@ class RoutePlanner:
         speed = distance / duration * 3.6
         trunk = line.trunk_score if line else 0.50
         headway = line.median_headway_s if line else None
+        focus = ROUTE_FOCUS_CONFIG[route_focus]
+        bike_speed = float(PROFILE_CONFIG[profile]["speed_mps"])
+        estimated_bike = distance / max(0.5, bike_speed) * 1.18
+        board_alight = 75 if mode in {"BUS", "TROLLEYBUS"} else 95
+        estimated_transit = wait_before + duration + board_alight
+        relative_advantage = estimated_bike - estimated_transit
 
-        max_distance = {
-            "BUS": 4_800,
-            "TROLLEYBUS": 4_800,
-            "TRAM": 3_800,
-            "RAIL": 2_200,
-        }.get(mode, 3_500)
-        max_distance *= { -2: 0.65, -1: 0.82, 0: 1.0, 1: 1.22, 2: 1.45 }[route_focus]
-
-        suspicious = sum(
-            [
-                distance < 1_500,
-                duration < 5 * 60,
-                speed < 14.0,
-                wait_before > 150,
-                headway is not None and headway > 10 * 60,
-                trunk < 0.55,
-            ]
+        # This gate controls only whether an exact OTP bicycle comparison is
+        # worth paying for.  The eventual decision is made by full relative
+        # utility, never by a fixed transit-distance cutoff.
+        uncertain_or_weak = (
+            relative_advantage < 4 * 60
+            or speed < float(PROFILE_CONFIG[profile]["speed_kmh"]) * 1.35
+            or wait_before > 90
+            or (headway is not None and headway > 8 * 60)
+            or trunk < 0.62
         )
-        return distance <= max_distance and suspicious >= 1
+        if mode in {"BUS", "TROLLEYBUS"}:
+            return uncertain_or_weak or route_focus > 0
+        if mode == "TRAM":
+            return uncertain_or_weak and (trunk < 0.74 or route_focus > 0)
+        if mode in {"RAIL", "SUBWAY"}:
+            return trunk < 0.62 or (
+                route_focus > 0
+                and relative_advantage < focus.min_transit_utility_seconds + 3 * 60
+            )
+        return uncertain_or_weak
 
     def _transit_leg_replacement_decision(
         self,
@@ -598,70 +1028,171 @@ class RoutePlanner:
         line: LineMetrics | None,
         downstream_trunk_score: float,
         route_focus: int,
+        next_transit_start: datetime | None = None,
+        replacement_arrival: datetime | None = None,
+        downstream_mode: str | None = None,
+        downstream_headway_s: float | None = None,
     ) -> dict[str, Any]:
-        distance = float(leg.get("distance") or 0)
         duration = max(1, int(leg.get("duration") or 0))
         bike_duration = max(1, int(bike.get("duration") or 0))
-        bike_distance = float(bike.get("bikeDistance") or 0)
         mode = str(leg.get("mode") or "")
-        speed = distance / duration * 3.6
         trunk = line.trunk_score if line else 0.50
         headway = line.median_headway_s if line else None
+        focus = ROUTE_FOCUS_CONFIG[route_focus]
 
-        board_alight_slack = 60 if mode in {"BUS", "TROLLEYBUS"} else 75
-        effective_transit = wait_before + duration + board_alight_slack
-        saving = effective_transit - bike_duration
-
-        evidence = 0
-        evidence += distance < 1_200
-        evidence += duration < 4 * 60
-        evidence += speed < 12.0
-        evidence += headway is not None and headway > 10 * 60
-        evidence += trunk < 0.55
-
-        # A weak local bus can be replaced over a somewhat longer bicycle leg,
-        # but rail and strong trunk lines are deliberately much harder to remove.
-        max_bike_distance = {
-            "BUS": 3_200,
-            "TROLLEYBUS": 3_200,
-            "TRAM": 2_500,
-            "RAIL": 1_600,
-        }.get(mode, 2_500)
-        max_bike_distance *= { -2: 0.60, -1: 0.80, 0: 1.0, 1: 1.35, 2: 1.70 }[route_focus]
-
-        required_saving = max(90.0, effective_transit * 0.15)
-        required_saving *= { -2: 1.55, -1: 1.25, 0: 1.0, 1: 0.82, 2: 0.68 }[route_focus]
-        if mode == "TRAM":
-            required_saving += 30
-        elif mode == "RAIL":
-            required_saving += 100
-        if trunk >= 0.72:
-            required_saving += 150
-        elif trunk >= 0.62:
-            required_saving += 75
-        if downstream_trunk_score >= 0.72:
-            # Preserve useful feeders unless the bicycle wins decisively.
-            required_saving += 60
-
-        required_evidence = 2
-        if trunk >= 0.72 or mode == "RAIL":
-            required_evidence = 3
-        elif trunk < 0.45 and mode in {"BUS", "TROLLEYBUS"}:
-            required_evidence = 1
+        utility = self._transit_leg_utility(
+            mode=mode,
+            ride_seconds=duration,
+            wait_seconds=wait_before,
+            bike_seconds=bike_duration,
+            trunk_score=trunk,
+            headway_s=headway,
+            downstream_trunk_score=downstream_trunk_score,
+            downstream_mode=downstream_mode,
+            downstream_headway_s=downstream_headway_s,
+            focus=focus,
+        )
+        catch_margin: int | None = None
+        misses_connection = False
+        if next_transit_start is not None and replacement_arrival is not None:
+            catch_margin = int((next_transit_start - replacement_arrival).total_seconds())
+            transfer_buffer = 45 if downstream_mode in {"RAIL", "SUBWAY"} else 30
+            misses_connection = catch_margin < transfer_buffer
 
         replace = (
-            evidence >= required_evidence
-            and bike_distance <= max_bike_distance
-            and saving >= required_saving
+            not misses_connection
+            and bike_duration <= focus.max_replacement_bike_seconds
+            and float(utility["utilitySeconds"]) < focus.min_transit_utility_seconds
+        )
+        reason = "scheduled_connection_protected" if misses_connection else (
+            "weak_relative_utility" if replace else "useful_transit_leg"
         )
         return {
             "replace": replace,
-            "reason": "weak_micro_transit" if trunk < 0.55 else "bike_materially_faster",
-            "savedSeconds": max(0, int(saving)),
-            "effectiveTransitSeconds": int(effective_transit),
-            "requiredSavingSeconds": round(required_saving),
-            "evidence": int(evidence),
+            "reason": reason,
+            "savedSeconds": max(
+                0,
+                int(utility["effectiveTransitSeconds"] - utility["bikeEquivalentSeconds"]),
+            ),
+            **utility,
+            "requiredUtilitySeconds": round(focus.min_transit_utility_seconds),
+            "catchMarginSeconds": catch_margin,
+            "missesDownstreamDeparture": misses_connection,
             "trunkScore": round(trunk, 3),
+        }
+
+    @staticmethod
+    def _transit_leg_utility(
+        *,
+        mode: str,
+        ride_seconds: int,
+        wait_seconds: int,
+        bike_seconds: int,
+        trunk_score: float,
+        headway_s: float | None,
+        downstream_trunk_score: float,
+        downstream_mode: str | None,
+        downstream_headway_s: float | None,
+        focus: RouteFocusConfig,
+    ) -> dict[str, Any]:
+        """Return the explainable relative value of using one transit leg.
+
+        Positive utility means transit has a real function; negative utility
+        means cycling between the same points is preferable.  Waiting, boarding,
+        detour, line quality, long-bike avoidance and downstream connection value
+        are represented once each to avoid double charging.
+        """
+
+        board_alight = {
+            "BUS": 85,
+            "TROLLEYBUS": 85,
+            "TRAM": 95,
+            "RAIL": 120,
+            "SUBWAY": 115,
+        }.get(mode, 90)
+        effective_transit = (wait_seconds + ride_seconds + board_alight) * focus.transit_cost_factor
+        bike_equivalent = bike_seconds * focus.bike_cost_factor
+        direct_advantage = bike_equivalent - effective_transit
+
+        mode_strength = {
+            "BUS": 0.05,
+            "TROLLEYBUS": 0.06,
+            "TRAM": 0.22,
+            "RAIL": 0.48,
+            "SUBWAY": 0.46,
+        }.get(mode, 0.0)
+        quality_value = ride_seconds * (
+            mode_strength + max(0.0, trunk_score - 0.45) * 1.15
+        )
+        quality_value += max(0.0, trunk_score - 0.65) * 300.0
+        quality_value *= focus.trunk_access_bonus_factor
+
+        # A long or topologically difficult bike alternative is useful evidence
+        # that transit is crossing a barrier or serving a genuine corridor.
+        long_bike_value = max(0.0, bike_seconds - 9 * 60) * 0.32
+        barrier_value = max(0.0, bike_seconds - ride_seconds * 1.45) * 0.38
+
+        downstream_value = 0.0
+        if downstream_mode:
+            downstream_value = (
+                170.0
+                * downstream_trunk_score**2
+                * focus.feeder_protection
+            )
+            if downstream_mode in {"RAIL", "SUBWAY"}:
+                downstream_value += 70.0 * focus.feeder_protection
+            # Sparse downstream departures make a catchable feeder more valuable.
+            if downstream_headway_s:
+                downstream_value += min(100.0, downstream_headway_s * 0.08)
+
+        reliability_cost = 0.0
+        if headway_s:
+            reliability_cost = min(90.0, max(0.0, headway_s - 8 * 60) * 0.10)
+
+        value = (
+            direct_advantage
+            + quality_value
+            + long_bike_value
+            + barrier_value
+            + downstream_value
+            - reliability_cost
+        )
+        return {
+            "utilitySeconds": round(value),
+            "effectiveTransitSeconds": round(effective_transit),
+            "bikeEquivalentSeconds": round(bike_equivalent),
+            "doorTimeAdvantageSeconds": round(direct_advantage),
+            "qualityValueSeconds": round(quality_value),
+            "longBikeValueSeconds": round(long_bike_value + barrier_value),
+            "downstreamValueSeconds": round(downstream_value),
+            "reliabilityCostSeconds": round(reliability_cost),
+        }
+
+    def _next_transit_context(
+        self,
+        legs: list[dict[str, Any]],
+        *,
+        index: int,
+        previous_arrival: datetime,
+        replacement_duration: int,
+    ) -> dict[str, Any]:
+        between = 0
+        for next_leg in legs[index + 1 :]:
+            if next_leg.get("transitLeg"):
+                metrics = self.gtfs.line_metrics_for_trip(next_leg.get("tripId"))
+                return {
+                    "next_transit_start": self._parse_leg_timestamp(next_leg.get("startTime")),
+                    "replacement_arrival": previous_arrival
+                    + timedelta(seconds=replacement_duration + between),
+                    "downstream_mode": str(next_leg.get("mode") or ""),
+                    "downstream_headway_s": metrics.median_headway_s if metrics else None,
+                }
+            between += int(next_leg.get("duration") or 0)
+        return {
+            "next_transit_start": None,
+            "replacement_arrival": None,
+            "downstream_mode": None,
+            "downstream_headway_s": None,
         }
 
     def _downstream_trunk_score(self, legs: list[dict[str, Any]], start: int) -> float:
@@ -718,6 +1249,76 @@ class RoutePlanner:
 
         return route_start, current, waiting_total, self._merge_adjacent_bicycle_legs(scheduled)
 
+    @classmethod
+    def _route_boundary(
+        cls,
+        legs: list[dict[str, Any]],
+        boundary: int,
+    ) -> dict[str, Any] | None:
+        """Return a reliable coordinate and place object between two legs."""
+
+        candidates: list[tuple[dict[str, Any], list[float] | None]] = []
+        if boundary > 0:
+            previous = legs[boundary - 1]
+            geometry = ((previous.get("geometry") or {}).get("coordinates") or [])
+            candidates.append(
+                (
+                    previous.get("to") or {},
+                    geometry[-1] if geometry else None,
+                )
+            )
+        if boundary < len(legs):
+            following = legs[boundary]
+            geometry = ((following.get("geometry") or {}).get("coordinates") or [])
+            candidates.append(
+                (
+                    following.get("from") or {},
+                    geometry[0] if geometry else None,
+                )
+            )
+
+        for place, coordinate in candidates:
+            try:
+                lat = float(place["lat"])
+                lon = float(place["lon"])
+            except (KeyError, TypeError, ValueError):
+                if not coordinate or len(coordinate) < 2:
+                    continue
+                try:
+                    lon = float(coordinate[0])
+                    lat = float(coordinate[1])
+                except (TypeError, ValueError):
+                    continue
+            return {
+                "lat": lat,
+                "lon": lon,
+                "place": {
+                    "name": place.get("name")
+                    or ("Старт" if boundary == 0 else "Финиш" if boundary == len(legs) else "Точка смены"),
+                    "lat": lat,
+                    "lon": lon,
+                },
+            }
+        return None
+
+    @staticmethod
+    def _schedule_street_legs(
+        legs: list[dict[str, Any]],
+        *,
+        route_start: datetime,
+    ) -> tuple[datetime, list[dict[str, Any]]]:
+        current = route_start
+        scheduled: list[dict[str, Any]] = []
+        for raw in legs:
+            leg = deepcopy(raw)
+            leg.pop("_fixedTransitStart", None)
+            leg.pop("_fixedTransitEnd", None)
+            leg["startTime"] = current.isoformat()
+            current += timedelta(seconds=int(leg.get("duration") or 0))
+            leg["endTime"] = current.isoformat()
+            scheduled.append(leg)
+        return current, RoutePlanner._merge_adjacent_bicycle_legs(scheduled)
+
     # --------------------------------------------------------------- anchor search
 
     def _anchor_candidates(
@@ -730,6 +1331,7 @@ class RoutePlanner:
         departure: datetime,
         profile: str,
         max_transfers: int,
+        route_focus: int,
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         boarding: list[dict[str, Any]] = []
         egress: list[dict[str, Any]] = []
@@ -740,10 +1342,22 @@ class RoutePlanner:
             role, anchor = job
             if role == "boarding":
                 return role, self._boarding_anchor_routes(
-                    anchor, origin, destination, departure, profile, max_transfers
+                    anchor,
+                    origin,
+                    destination,
+                    departure,
+                    profile,
+                    max_transfers,
+                    route_focus,
                 )
             return role, self._egress_anchor_routes(
-                anchor, origin, destination, departure, profile, max_transfers
+                anchor,
+                origin,
+                destination,
+                departure,
+                profile,
+                max_transfers,
+                route_focus,
             )
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=self.anchor_workers) as pool:
@@ -765,42 +1379,66 @@ class RoutePlanner:
         departure: datetime,
         profile: str,
         max_transfers: int,
+        route_focus: int,
     ) -> list[dict[str, Any]]:
+        focus = ROUTE_FOCUS_CONFIG[route_focus]
         bike = self._bike_between_points(origin, (anchor.lat, anchor.lon), departure, profile)
-        if bike is None or float(bike.get("bikeDistance") or 0) < 180:
+        bike_distance = float((bike or {}).get("bikeDistance") or 0)
+        if bike is None or bike_distance < 180 or bike_distance > focus.max_bike_access_m * 1.18:
             return []
 
         bike_duration = int(bike.get("duration") or 0)
         transit_departure = departure + timedelta(seconds=bike_duration + 35)
         gtfs_id = f"{self.feed_id}:{anchor.stop_id}"
-        nodes, _ = self.otp.plan(
-            origin=stop_location(gtfs_id, anchor.name),
-            destination=coordinate_location(*destination, "Финиш"),
-            departure=transit_departure,
-            profile=profile,
-            transit_modes=ALL_TRANSIT,
-            max_transfers=max_transfers,
-            transit_only=True,
-            access_mode="WALK",
-            egress_mode="BICYCLE",
-            transfer_mode="BICYCLE",
-            first=6,
-        )
 
         result: list[dict[str, Any]] = []
-        for node in nodes:
-            second = self._normalize_route(
-                node,
-                requested_departure=transit_departure,
-                profile_key=profile,
-                strategy="boarding_anchor_tail",
-                source_query="boarding_anchor",
+        query_specs = self._anchor_mode_queries(anchor)
+        transfer_cap = max(0, max_transfers - focus.transfer_reduction)
+        for query_name, modes in query_specs:
+            nodes, _ = self.otp.plan(
+                origin=stop_location(gtfs_id, anchor.name),
+                destination=coordinate_location(*destination, "Финиш"),
+                departure=transit_departure,
+                profile=profile,
+                transit_modes=modes,
+                max_transfers=transfer_cap,
+                transit_only=True,
+                access_mode="WALK",
+                egress_mode="BICYCLE",
+                transfer_mode="BICYCLE",
+                first=max(6, focus.otp_candidates_per_query // 2),
             )
-            if second.get("kind") != "mixed" or float(second.get("transitDistance") or 0) < 800:
-                continue
-            result.append(self._combine_boarding_route(bike, second, anchor, departure, profile))
-        result.sort(key=lambda r: (r["score"], r["doorToDoor"]))
-        return result[:2]
+            for node in nodes:
+                second = self._normalize_route(
+                    node,
+                    requested_departure=transit_departure,
+                    profile_key=profile,
+                    strategy="boarding_anchor_tail",
+                    source_query=f"boarding_anchor_{query_name}",
+                )
+                if second.get("kind") != "mixed":
+                    continue
+                actual_trunk = float(second.get("bestTrunkScore") or 0)
+                strategy = (
+                    "trunk_access"
+                    if query_name == "trunk"
+                    and anchor.best_trunk_score >= 0.58
+                    and actual_trunk >= 0.50
+                    else "boarding_anchor"
+                )
+                result.append(
+                    self._combine_boarding_route(
+                        bike,
+                        second,
+                        anchor,
+                        departure,
+                        profile,
+                        strategy=strategy,
+                    )
+                )
+        result = self._dedupe_exact(result)
+        result.sort(key=lambda r: (self._candidate_generation_priority(r, route_focus), r["doorToDoor"]))
+        return result[:4]
 
     def _egress_anchor_routes(
         self,
@@ -810,41 +1448,70 @@ class RoutePlanner:
         departure: datetime,
         profile: str,
         max_transfers: int,
+        route_focus: int,
     ) -> list[dict[str, Any]]:
+        focus = ROUTE_FOCUS_CONFIG[route_focus]
         gtfs_id = f"{self.feed_id}:{anchor.stop_id}"
-        nodes, _ = self.otp.plan(
-            origin=coordinate_location(*origin, "Старт"),
-            destination=stop_location(gtfs_id, anchor.name),
-            departure=departure,
-            profile=profile,
-            transit_modes=ALL_TRANSIT,
-            max_transfers=max_transfers,
-            transit_only=True,
-            access_mode="BICYCLE",
-            egress_mode="WALK",
-            transfer_mode="BICYCLE",
-            first=5,
-        )
         bike = self._bike_between_points(
             (anchor.lat, anchor.lon), destination, departure, profile
         )
-        if bike is None:
+        bike_distance = float((bike or {}).get("bikeDistance") or 0)
+        if bike is None or bike_distance > focus.max_bike_egress_m * 1.18:
             return []
 
         result: list[dict[str, Any]] = []
-        for node in nodes:
-            first = self._normalize_route(
-                node,
-                requested_departure=departure,
-                profile_key=profile,
-                strategy="egress_anchor_head",
-                source_query="egress_anchor",
+        transfer_cap = max(0, max_transfers - focus.transfer_reduction)
+        for query_name, modes in self._anchor_mode_queries(anchor):
+            nodes, _ = self.otp.plan(
+                origin=coordinate_location(*origin, "Старт"),
+                destination=stop_location(gtfs_id, anchor.name),
+                departure=departure,
+                profile=profile,
+                transit_modes=modes,
+                max_transfers=transfer_cap,
+                transit_only=True,
+                access_mode="BICYCLE",
+                egress_mode="WALK",
+                transfer_mode="BICYCLE",
+                first=max(6, focus.otp_candidates_per_query // 2),
             )
-            if first.get("kind") != "mixed" or float(first.get("transitDistance") or 0) < 800:
-                continue
-            result.append(self._combine_egress_route(first, bike, anchor, profile))
-        result.sort(key=lambda r: (r["score"], r["doorToDoor"]))
-        return result[:2]
+            for node in nodes:
+                first = self._normalize_route(
+                    node,
+                    requested_departure=departure,
+                    profile_key=profile,
+                    strategy="egress_anchor_head",
+                    source_query=f"egress_anchor_{query_name}",
+                )
+                if first.get("kind") != "mixed":
+                    continue
+                result.append(self._combine_egress_route(first, bike, anchor, profile))
+        result = self._dedupe_exact(result)
+        result.sort(key=lambda r: (self._candidate_generation_priority(r, route_focus), r["doorToDoor"]))
+        return result[:4]
+
+    @staticmethod
+    def _anchor_mode_queries(anchor: Anchor) -> list[tuple[str, list[str]]]:
+        modes = set(anchor.modes)
+        if anchor.best_trunk_score < 0.58 and not modes.intersection(
+            {"RAIL", "SUBWAY", "TRAM"}
+        ):
+            return [("all", ALL_TRANSIT)]
+        if "RAIL" in modes:
+            trunk_modes = ["RAIL"]
+        elif "SUBWAY" in modes:
+            trunk_modes = ["SUBWAY"]
+        elif "TRAM" in modes:
+            trunk_modes = ["TRAM"]
+        else:
+            trunk_modes = [m for m in ("BUS", "TROLLEYBUS") if m in modes] or [
+                "BUS",
+                "TROLLEYBUS",
+            ]
+        result = [("trunk", trunk_modes)]
+        if set(trunk_modes) != set(ALL_TRANSIT):
+            result.append(("all", ALL_TRANSIT))
+        return result
 
     def _combine_boarding_route(
         self,
@@ -853,6 +1520,7 @@ class RoutePlanner:
         anchor: Anchor,
         departure: datetime,
         profile: str,
+        strategy: str = "boarding_anchor",
     ) -> dict[str, Any]:
         bike_legs = deepcopy(bike.get("legs") or [])
         cursor = departure
@@ -867,8 +1535,8 @@ class RoutePlanner:
         route = {
             "id": "",
             "kind": "mixed",
-            "strategy": "boarding_anchor",
-            "sourceQuery": "boarding_anchor",
+            "strategy": strategy,
+            "sourceQuery": tail.get("sourceQuery") or "boarding_anchor",
             "duration": max(0, int((tail_end - departure).total_seconds())),
             "initialWait": 0,
             "doorToDoor": max(0, int((tail_end - departure).total_seconds())),
@@ -878,6 +1546,7 @@ class RoutePlanner:
             "waitingTime": max(int(tail.get("waitingTime") or 0), wait_gap),
             "legs": bike_legs + deepcopy(tail.get("legs") or []),
             "anchor": self._anchor_json(anchor, "boarding", bike_distance=float(bike.get("bikeDistance") or 0)),
+            "streetPreference": bike.get("streetPreference") or "cycleway",
         }
         return self._score_route(route, profile)
 
@@ -913,6 +1582,7 @@ class RoutePlanner:
             "waitingTime": int(head.get("waitingTime") or 0),
             "legs": deepcopy(head.get("legs") or []) + bike_legs,
             "anchor": self._anchor_json(anchor, "egress", bike_distance=float(bike.get("bikeDistance") or 0)),
+            "streetPreference": bike.get("streetPreference") or "cycleway",
         }
         return self._score_route(route, profile)
 
@@ -989,6 +1659,11 @@ class RoutePlanner:
                     profile_key=profile,
                     strategy="bike_segment",
                     source_query="bike_segment",
+                    street_preference={
+                        "fast": "direct",
+                        "balanced": "cycleway",
+                        "calm": "quiet",
+                    }.get(profile, "cycleway"),
                 )
                 for node in nodes
             ]
@@ -1011,6 +1686,7 @@ class RoutePlanner:
         profile_key: str,
         strategy: str,
         source_query: str,
+        street_preference: str | None = None,
     ) -> dict[str, Any]:
         start_dt = parse_otp_time(itinerary.get("start"))
         end_dt = parse_otp_time(itinerary.get("end"))
@@ -1075,6 +1751,7 @@ class RoutePlanner:
             "kind": "mixed" if has_transit else "bike" if has_bike else "other",
             "strategy": strategy,
             "sourceQuery": source_query,
+            "streetPreference": street_preference,
             "duration": duration,
             "initialWait": initial_wait,
             "doorToDoor": initial_wait + duration,
@@ -1117,6 +1794,64 @@ class RoutePlanner:
             previous_trip = trip_id
         return max(0, boardings - 1)
 
+    @staticmethod
+    def _is_user_transition(left: dict[str, Any], right: dict[str, Any]) -> bool:
+        if left.get("transitLeg") and right.get("transitLeg"):
+            if right.get("interlineWithPreviousLeg"):
+                return False
+            left_trip = left.get("tripId")
+            right_trip = right.get("tripId")
+            if left_trip and right_trip and left_trip == right_trip:
+                return False
+        if (
+            not left.get("transitLeg")
+            and not right.get("transitLeg")
+            and left.get("mode") == right.get("mode")
+        ):
+            return False
+        return True
+
+    @classmethod
+    def _route_transition_points(cls, legs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        points: list[dict[str, Any]] = []
+        for left, right in zip(legs, legs[1:]):
+            if not cls._is_user_transition(left, right):
+                continue
+            left_to = left.get("to") or {}
+            right_from = right.get("from") or {}
+            lat = left_to.get("lat")
+            lon = left_to.get("lon")
+            if lat is None:
+                lat = right_from.get("lat")
+            if lon is None:
+                lon = right_from.get("lon")
+            if lat is None or lon is None:
+                left_geometry = ((left.get("geometry") or {}).get("coordinates") or [])
+                right_geometry = ((right.get("geometry") or {}).get("coordinates") or [])
+                coordinate = left_geometry[-1] if left_geometry else (
+                    right_geometry[0] if right_geometry else None
+                )
+                if coordinate:
+                    lon, lat = coordinate
+            left_route = left.get("route") or {}
+            right_route = right.get("route") or {}
+            points.append(
+                {
+                    "index": len(points) + 1,
+                    # Keep transitions without coordinates in the count. The
+                    # frontend simply skips their map marker, while the route
+                    # card still reflects every visible change of segment.
+                    "lat": float(lat) if lat is not None else None,
+                    "lon": float(lon) if lon is not None else None,
+                    "name": left_to.get("name") or right_from.get("name") or "Пересадка",
+                    "fromMode": left.get("mode"),
+                    "toMode": right.get("mode"),
+                    "fromRoute": left_route.get("shortName") or left_route.get("longName"),
+                    "toRoute": right_route.get("shortName") or right_route.get("longName"),
+                }
+            )
+        return points
+
     def _refresh_route_metrics(self, route: dict[str, Any]) -> dict[str, Any]:
         route = deepcopy(route)
         legs = route.get("legs") or []
@@ -1133,44 +1868,58 @@ class RoutePlanner:
         transit_distance = sum(
             float(leg.get("distance") or 0) for leg in legs if leg.get("transitLeg")
         )
+        bike_duration = sum(
+            int(leg.get("duration") or 0)
+            for leg in legs
+            if leg.get("mode") == "BICYCLE" and not leg.get("transitLeg")
+        )
+        walk_duration = sum(
+            int(leg.get("duration") or 0)
+            for leg in legs
+            if leg.get("mode") == "WALK" and not leg.get("transitLeg")
+        )
+        transit_duration = sum(
+            int(leg.get("duration") or 0) for leg in legs if leg.get("transitLeg")
+        )
         transit_legs = [leg for leg in legs if leg.get("transitLeg")]
-        transfers = self._actual_transfer_count(route)
-        boardings = transfers + (1 if transit_legs else 0)
+        transit_transfers = self._actual_transfer_count(route)
+        boardings = transit_transfers + (1 if transit_legs else 0)
+        transfer_points = self._route_transition_points(legs)
+        transfers = len(transfer_points)
 
         movement = bike_distance + transit_distance
         route["bikeDistance"] = round(bike_distance, 1)
         route["walkDistance"] = round(walk_distance, 1)
         route["transitDistance"] = round(transit_distance, 1)
+        route["bikeDuration"] = bike_duration
+        route["walkDuration"] = walk_duration
+        route["transitDuration"] = transit_duration
         route["transfers"] = transfers
+        route["routeTransitions"] = transfers
+        route["transitTransfers"] = transit_transfers
+        route["transferPoints"] = transfer_points
         route["bikeBoardings"] = boardings
+        route["transitBoardings"] = boardings
         route["bikeShare"] = round(bike_distance / movement, 4) if movement else 0.0
         route["transitShare"] = round(transit_distance / movement, 4) if movement else 0.0
 
         trunk_weight = 0.0
         trunk_duration = 0.0
-        weak_micro_penalty = 0.0
         best_trunk = 0.0
         best_trunk_name: str | None = None
         for leg in transit_legs:
             lm = leg.get("lineMetrics") or {}
             trunk = float(lm.get("trunkScore") or 0.50)
             duration = float(leg.get("duration") or 0)
-            distance = float(leg.get("distance") or 0)
             trunk_weight += trunk * duration
             trunk_duration += duration
             route_name = (leg.get("route") or {}).get("shortName") or (leg.get("route") or {}).get("longName")
             if trunk > best_trunk:
                 best_trunk = trunk
                 best_trunk_name = route_name
-            if distance < 1_400 and trunk < 0.48:
-                weak_micro_penalty += 120
-            if duration < 4 * 60 and trunk < 0.42:
-                weak_micro_penalty += 60
-
         route["avgTrunkScore"] = round(trunk_weight / trunk_duration, 3) if trunk_duration else 0.0
         route["bestTrunkScore"] = round(best_trunk, 3)
         route["bestTrunkRoute"] = best_trunk_name
-        route["microTransitPenalty"] = round(weak_micro_penalty)
         return route
 
     def _score_route(self, route: dict[str, Any], profile_key: str) -> dict[str, Any]:
@@ -1178,10 +1927,11 @@ class RoutePlanner:
         cfg = PROFILE_CONFIG[profile_key]
 
         wait_cost = float(route.get("waitingTime") or 0) * float(cfg["wait_factor"])
-        transfer_cost = int(route.get("transfers") or 0) * float(cfg["transfer_penalty"])
+        transfer_cost = int(route.get("transitTransfers") or 0) * float(cfg["transfer_penalty"])
         boarding_cost = int(route.get("bikeBoardings") or 0) * float(cfg["bike_boarding_penalty"])
         walk_cost = (float(route.get("walkDistance") or 0) / 1000.0) * 180.0
-        micro_penalty = float(route.get("microTransitPenalty") or 0)
+        micro_penalty, leg_utilities = self._estimated_micro_transit_penalty(route, profile_key)
+        complexity_cost = int(route.get("routeTransitions") or 0) * 45.0
 
         avg_trunk = float(route.get("avgTrunkScore") or 0)
         transit_seconds = sum(
@@ -1193,27 +1943,82 @@ class RoutePlanner:
 
         discomfort = max(
             0.0,
-            wait_cost + transfer_cost + boarding_cost + walk_cost + micro_penalty - trunk_bonus,
+            wait_cost
+            + transfer_cost
+            + boarding_cost
+            + walk_cost
+            + micro_penalty
+            + complexity_cost
+            - trunk_bonus,
         )
         score = float(route.get("doorToDoor") or 0) + discomfort
 
-        # A mixed route whose transit contribution is almost cosmetic should not
-        # outrank a clean direct bicycle route merely because of schedule noise.
-        if route.get("kind") == "mixed":
-            transit_distance = float(route.get("transitDistance") or 0)
-            movement = transit_distance + float(route.get("bikeDistance") or 0)
-            if transit_distance < 650:
-                score += 360
-            if movement and transit_distance / movement < 0.07:
-                score += 260
-
         route["discomfort"] = round(discomfort)
+        route["microTransitPenalty"] = round(micro_penalty)
+        route["complexityCost"] = round(complexity_cost)
+        route["transitLegUtilities"] = leg_utilities
         route["trunkBonus"] = round(trunk_bonus)
         route["baseScore"] = round(score)
         route["score"] = round(score)
         route["transitModes"] = transit_modes(route)
         route["transitRoutes"] = transit_route_names(route)
         return route
+
+    def _estimated_micro_transit_penalty(
+        self,
+        route: dict[str, Any],
+        profile_key: str,
+    ) -> tuple[float, list[dict[str, Any]]]:
+        transit_legs = [leg for leg in route.get("legs") or [] if leg.get("transitLeg")]
+        if not transit_legs:
+            return 0.0, []
+        profile = PROFILE_CONFIG[profile_key]
+        allocated_wait = float(route.get("waitingTime") or 0) / len(transit_legs)
+        details: list[dict[str, Any]] = []
+        penalty = 0.0
+        for leg in transit_legs:
+            existing = leg.get("transitUtility") or {}
+            if existing.get("utilitySeconds") is not None:
+                utility = float(existing["utilitySeconds"])
+                source = "otp_bike_comparison"
+            else:
+                distance = float(leg.get("distance") or 0)
+                estimated_bike = max(
+                    1,
+                    round(distance / max(0.5, float(profile["speed_mps"])) * 1.18),
+                )
+                lm = leg.get("lineMetrics") or {}
+                estimate = self._transit_leg_utility(
+                    mode=str(leg.get("mode") or ""),
+                    ride_seconds=max(1, int(leg.get("duration") or 0)),
+                    wait_seconds=round(allocated_wait),
+                    bike_seconds=estimated_bike,
+                    trunk_score=float(lm.get("trunkScore") or 0.50),
+                    headway_s=lm.get("medianHeadway"),
+                    downstream_trunk_score=0.0,
+                    downstream_mode=None,
+                    downstream_headway_s=None,
+                    focus=ROUTE_FOCUS_CONFIG[0],
+                )
+                utility = float(estimate["utilitySeconds"])
+                source = "estimated"
+
+            # This is a soft route-level guard for candidates which did not pass
+            # through the exact segment optimiser.  The penalty is relative to
+            # utility and capped; no distance threshold decides the outcome.
+            leg_penalty = min(420.0, max(0.0, 20.0 - utility) * 0.65)
+            penalty += leg_penalty
+            details.append(
+                {
+                    "mode": leg.get("mode"),
+                    "route": (leg.get("route") or {}).get("shortName")
+                    or (leg.get("route") or {}).get("longName"),
+                    "utilitySeconds": round(utility),
+                    "penaltySeconds": round(leg_penalty),
+                    "source": source,
+                }
+            )
+        return penalty, details
 
     # ------------------------------------------------------------ focus / Pareto
 
@@ -1252,11 +2057,11 @@ class RoutePlanner:
             )
 
         target = self._base_target_bike_share(reference_distance)
-        target += { -2: -0.20, -1: -0.10, 0: 0.0, 1: 0.15, 2: 0.30 }[route_focus]
+        target += focus_cfg.target_bike_share_shift
         target = max(0.05, min(0.95, target))
 
         best_time = max(1, min(int(r.get("doorToDoor") or 0) for r in routes))
-        allowed_ratio = 1.0 + float(focus_cfg["time_tolerance_ratio"])
+        allowed_ratio = 1.0 + focus_cfg.time_tolerance_ratio
         result: list[dict[str, Any]] = []
 
         for raw in routes:
@@ -1269,11 +2074,22 @@ class RoutePlanner:
             else:
                 share_gap = abs(bike_share - target)
 
-            share_penalty = share_gap * float(focus_cfg["share_penalty_seconds"])
+            share_penalty = share_gap * focus_cfg.share_penalty_seconds
             transfer_adjustment = (
-                int(route.get("transfers") or 0)
+                int(route.get("transitTransfers") or 0)
                 * float(profile_cfg["transfer_penalty"])
-                * (float(focus_cfg["transfer_penalty_factor"]) - 1.0)
+                * (focus_cfg.transfer_penalty_factor - 1.0)
+            )
+            modality_adjustment = (
+                float(route.get("bikeDuration") or 0) * (focus_cfg.bike_cost_factor - 1.0)
+                + float(route.get("transitDuration") or 0)
+                * (focus_cfg.transit_cost_factor - 1.0)
+            )
+            short_transit_adjustment = float(route.get("microTransitPenalty") or 0) * (
+                focus_cfg.short_transit_penalty_factor - 1.0
+            )
+            trunk_adjustment = -float(route.get("trunkBonus") or 0) * (
+                focus_cfg.trunk_access_bonus_factor - 1.0
             )
             time_ratio = float(route.get("doorToDoor") or best_time) / best_time
             detour_penalty = 0.0
@@ -1284,32 +2100,295 @@ class RoutePlanner:
                 float(route.get("baseScore") or 0)
                 + share_penalty
                 + transfer_adjustment
+                + modality_adjustment
+                + short_transit_adjustment
+                + trunk_adjustment
                 + detour_penalty
             )
             route["preference"] = {
                 "focus": route_focus,
-                "focusName": focus_cfg["name"],
+                "focusName": focus_cfg.name,
                 "targetBikeShare": round(target, 3),
                 "actualBikeShare": round(bike_share, 3),
                 "referenceDistance": round(reference_distance, 1),
                 "timeRatio": round(time_ratio, 3),
                 "allowedTimeRatio": round(allowed_ratio, 3),
+                "bikeCostFactor": focus_cfg.bike_cost_factor,
+                "transitCostFactor": focus_cfg.transit_cost_factor,
+                "shortTransitPenaltyFactor": focus_cfg.short_transit_penalty_factor,
+                "transferPenaltyFactor": focus_cfg.transfer_penalty_factor,
             }
             result.append(route)
         return result
 
-    def _pareto_prune(self, routes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def _candidate_generation_priority(self, route: dict[str, Any], route_focus: int) -> float:
+        """Focus-aware priority used before expensive candidate optimisation."""
+        focus = ROUTE_FOCUS_CONFIG[min(2, max(-2, int(route_focus)))]
+        route = self._refresh_route_metrics(route)
+        return (
+            float(route.get("baseScore") or route.get("score") or route.get("doorToDoor") or 0)
+            + float(route.get("bikeDuration") or 0) * (focus.bike_cost_factor - 1.0)
+            + float(route.get("transitDuration") or 0) * (focus.transit_cost_factor - 1.0)
+            + int(route.get("transitTransfers") or 0)
+            * 180.0
+            * (focus.transfer_penalty_factor - 1.0)
+            - float(route.get("trunkBonus") or 0)
+            * (focus.trunk_access_bonus_factor - 1.0)
+        )
+
+    def _classify_strategies(
+        self,
+        routes: list[dict[str, Any]],
+        *,
+        route_focus: int,
+    ) -> list[dict[str, Any]]:
+        if not routes:
+            return []
+        best_time = min(float(r.get("doorToDoor") or math.inf) for r in routes)
+        best_score = min(float(r.get("score") or math.inf) for r in routes)
+        mixed = [r for r in routes if r.get("kind") == "mixed"]
+        best_bike_heavy = (
+            max(
+                mixed,
+                key=lambda r: (
+                    float(r.get("bikeShare") or 0),
+                    -float(r.get("score") or math.inf),
+                ),
+            )
+            if mixed
+            else None
+        )
+        best_transit_heavy = (
+            max(
+                mixed,
+                key=lambda r: (
+                    float(r.get("transitShare") or 0),
+                    -float(r.get("score") or math.inf),
+                ),
+            )
+            if mixed
+            else None
+        )
+        min_mixed_transfers = min(
+            (int(r.get("transfers") or 0) for r in mixed),
+            default=0,
+        )
+        classified: list[dict[str, Any]] = []
+        for raw in routes:
+            route = raw
+            archetypes: list[str] = []
+            kind = route.get("kind")
+            bike_share = float(route.get("bikeShare") or 0)
+            transit_share = float(route.get("transitShare") or 0)
+            strategy = route.get("strategy")
+            anchor = route.get("anchor") or {}
+
+            if kind == "bike":
+                archetypes.append("DIRECT_BIKE")
+            if float(route.get("bikeDistance") or 0) >= 300:
+                bicycle_archetype = {
+                    "direct": "BIKE_DIRECT",
+                    "cycleway": "BIKE_CYCLEWAY",
+                    "quiet": "BIKE_QUIET",
+                }.get(str(route.get("streetPreference") or ""))
+                if bicycle_archetype:
+                    archetypes.append(bicycle_archetype)
+            if float(route.get("doorToDoor") or math.inf) <= best_time + 30:
+                archetypes.append("FASTEST")
+            if float(route.get("score") or math.inf) <= best_score + 45:
+                archetypes.append("BALANCED")
+            if kind == "mixed" and (
+                transit_share >= 0.52 or route is best_transit_heavy
+            ):
+                archetypes.append("TRANSIT_HEAVY")
+            if kind == "mixed" and (
+                bike_share >= 0.52 or route is best_bike_heavy
+            ):
+                archetypes.append("BIKE_HEAVY")
+            if (
+                strategy == "trunk_access"
+                or (
+                    anchor.get("type") == "boarding"
+                    and float(route.get("bestTrunkScore") or 0) >= 0.58
+                )
+            ):
+                archetypes.append("TRUNK_ACCESS")
+            if set(route.get("transitModes", [])).intersection({"RAIL", "SUBWAY"}):
+                archetypes.append("RAIL")
+            if strategy == "egress_anchor":
+                archetypes.append("EARLY_EGRESS")
+            if kind == "mixed" and int(route.get("transfers") or 0) == min_mixed_transfers:
+                archetypes.append("LOW_TRANSFER")
+
+            if not archetypes:
+                archetypes.append("BALANCED")
+            if route_focus >= 1:
+                primary_order = (
+                    "BIKE_CYCLEWAY",
+                    "BIKE_DIRECT",
+                    "BIKE_QUIET",
+                    "DIRECT_BIKE",
+                    "BIKE_HEAVY",
+                    "TRUNK_ACCESS",
+                    "RAIL",
+                    "EARLY_EGRESS",
+                    "TRANSIT_HEAVY",
+                    "LOW_TRANSFER",
+                    "BALANCED",
+                    "FASTEST",
+                )
+            else:
+                primary_order = (
+                    "BIKE_CYCLEWAY",
+                    "BIKE_DIRECT",
+                    "BIKE_QUIET",
+                    "DIRECT_BIKE",
+                    "TRUNK_ACCESS",
+                    "RAIL",
+                    "EARLY_EGRESS",
+                    "TRANSIT_HEAVY",
+                    "BIKE_HEAVY",
+                    "LOW_TRANSFER",
+                    "BALANCED",
+                    "FASTEST",
+                )
+            route["archetypes"] = list(dict.fromkeys(archetypes))
+            route["strategyArchetype"] = next(
+                item for item in primary_order if item in route["archetypes"]
+            )
+            route["strategyGroup"] = self._strategy_group(route)
+            classified.append(route)
+        return classified
+
+    @staticmethod
+    def _strategy_group(route: dict[str, Any]) -> str:
+        """Return a user-visible strategy bucket, coarser than an itinerary.
+
+        Pareto is allowed to remove another variant inside this bucket, but the
+        best route to a different trunk/surface corridor is preserved. This is
+        the missing layer between broad archetypes such as TRANSIT_HEAVY and an
+        exact stop-by-stop signature.
+        """
+
+        if route.get("kind") == "bike":
+            return f"bike:{route.get('streetPreference') or 'default'}"
+
+        transit_legs = [leg for leg in route.get("legs") or [] if leg.get("transitLeg")]
+        if not transit_legs:
+            return f"other:{route.get('strategy') or 'unknown'}"
+
+        def route_token(leg: dict[str, Any]) -> str:
+            route_obj = leg.get("route") or {}
+            name = (
+                route_obj.get("shortName")
+                or route_obj.get("longName")
+                or leg.get("mode")
+                or "?"
+            )
+            return f"{leg.get('mode') or '?'}:{name}"
+
+        dominant = max(
+            transit_legs,
+            key=lambda leg: (
+                float(leg.get("distance") or 0),
+                float((leg.get("lineMetrics") or {}).get("trunkScore") or 0),
+                int(leg.get("duration") or 0),
+            ),
+        )
+        modes: list[str] = []
+        chain: list[str] = []
+        for leg in transit_legs:
+            mode = str(leg.get("mode") or "?")
+            if not modes or modes[-1] != mode:
+                modes.append(mode)
+            token = route_token(leg)
+            if not chain or chain[-1] != token:
+                chain.append(token)
+
+        legs = route.get("legs") or []
+        first_transit = next(
+            (index for index, leg in enumerate(legs) if leg.get("transitLeg")),
+            0,
+        )
+        last_transit = max(
+            (index for index, leg in enumerate(legs) if leg.get("transitLeg")),
+            default=len(legs) - 1,
+        )
+        access_m = sum(
+            float(leg.get("distance") or 0)
+            for leg in legs[:first_transit]
+            if leg.get("mode") == "BICYCLE"
+        )
+        egress_m = sum(
+            float(leg.get("distance") or 0)
+            for leg in legs[last_transit + 1 :]
+            if leg.get("mode") == "BICYCLE"
+        )
+
+        def distance_band(distance: float) -> str:
+            if distance < 1_200:
+                return "near"
+            if distance < 3_500:
+                return "medium"
+            return "far"
+
+        anchor = route.get("anchor") or {}
+        role = str(anchor.get("type") or route.get("strategy") or "mixed")
+        return ":".join(
+            (
+                role,
+                "-".join(modes),
+                route_token(dominant),
+                chain[0],
+                f"legs{len(chain)}",
+                distance_band(access_m),
+                distance_band(egress_m),
+                str(route.get("streetPreference") or "default"),
+            )
+        )
+
+    def _pareto_prune(
+        self,
+        routes: list[dict[str, Any]],
+        *,
+        route_focus: int = 0,
+        diagnostics: RoutingDiagnostics | None = None,
+    ) -> list[dict[str, Any]]:
         """Keep routes not clearly dominated on time, transfers and discomfort.
 
         Small epsilons avoid retaining dozens of routes that differ by seconds,
         while still preserving meaningful trade-offs such as no-transfer vs faster.
         """
+        if diagnostics:
+            diagnostics.pareto_before = len(routes)
         if len(routes) <= 2:
+            if diagnostics:
+                diagnostics.pareto_after = len(routes)
             return routes
+
+        routes = self._classify_strategies(routes, route_focus=route_focus)
+        protected: set[int] = set()
+        archetypes = {a for route in routes for a in route.get("archetypes") or []}
+        for archetype in archetypes:
+            best = self._best_for_archetype(routes, archetype)
+            if best is not None:
+                protected.add(id(best))
+        strategy_groups: dict[str, list[dict[str, Any]]] = {}
+        for route in routes:
+            strategy_groups.setdefault(
+                str(route.get("strategyGroup") or self._strategy_group(route)),
+                [],
+            ).append(route)
+        for grouped_routes in strategy_groups.values():
+            protected.add(id(min(grouped_routes, key=self._stable_route_key)))
 
         kept: list[dict[str, Any]] = []
         for candidate in routes:
             dominated = False
+            if id(candidate) in protected:
+                candidate["paretoStatus"] = "strategy_preserved"
+                kept.append(candidate)
+                continue
             c_time = float(candidate.get("doorToDoor") or math.inf)
             c_transfers = int(candidate.get("transfers") or 0)
             c_discomfort = float(candidate.get("discomfort") or 0)
@@ -1336,13 +2415,28 @@ class RoutePlanner:
                     if candidate.get("kind") == "bike" and other.get("kind") != "bike":
                         continue
                     dominated = True
+                    if diagnostics:
+                        diagnostics.reject(
+                            "dominated",
+                            candidate,
+                            dominatedBy={
+                                "strategy": other.get("strategy"),
+                                "archetypes": other.get("archetypes") or [],
+                                "doorToDoor": other.get("doorToDoor"),
+                                "score": other.get("score"),
+                            },
+                        )
                     break
             if not dominated:
+                candidate["paretoStatus"] = "non_dominated"
                 kept.append(candidate)
 
         if not kept:
-            kept = sorted(routes, key=lambda r: (r["score"], r["doorToDoor"]))[:12]
-        return sorted(kept, key=lambda r: (r["score"], r["doorToDoor"]))[:40]
+            kept = sorted(routes, key=self._stable_route_key)[:12]
+        kept = sorted(kept, key=self._stable_route_key)[:40]
+        if diagnostics:
+            diagnostics.pareto_after = len(kept)
+        return kept
 
     # ------------------------------------------------------- similarity / diversity
 
@@ -1352,20 +2446,46 @@ class RoutePlanner:
         *,
         limit: int,
         route_focus: int,
+        diagnostics: RoutingDiagnostics | None = None,
     ) -> list[dict[str, Any]]:
         if not routes:
             return []
         route_focus = min(2, max(-2, int(route_focus)))
         focus_cfg = ROUTE_FOCUS_CONFIG[route_focus]
-        routes = sorted(routes, key=lambda r: (r["score"], r["doorToDoor"]))
+        routes = sorted(routes, key=self._stable_route_key)
         best_time = min(float(r["doorToDoor"]) for r in routes)
         soft_limit = max(
-            best_time * (1.0 + float(focus_cfg["time_tolerance_ratio"])),
-            best_time + { -2: 10*60, -1: 12*60, 0: 15*60, 1: 22*60, 2: 30*60 }[route_focus],
+            best_time * (1.0 + focus_cfg.time_tolerance_ratio),
+            best_time + focus_cfg.time_tolerance_seconds,
         )
+        hard_limit = max(best_time * 2.0, best_time + 90 * 60)
         eligible = [r for r in routes if float(r["doorToDoor"]) <= soft_limit]
         if not eligible:
             eligible = routes
+
+        # The best representative of a strategy remains eligible even when an
+        # unusually fast direct bicycle route sits outside its normal time band.
+        for archetype in {a for r in routes for a in r.get("archetypes") or []}:
+            best = self._best_for_archetype(routes, archetype)
+            if (
+                best is not None
+                and float(best.get("doorToDoor") or math.inf) <= hard_limit
+                and best not in eligible
+            ):
+                eligible.append(best)
+        groups: dict[str, list[dict[str, Any]]] = {}
+        for route in routes:
+            groups.setdefault(
+                str(route.get("strategyGroup") or self._strategy_group(route)),
+                [],
+            ).append(route)
+        for grouped_routes in groups.values():
+            best = min(grouped_routes, key=self._stable_route_key)
+            if (
+                float(best.get("doorToDoor") or math.inf) <= hard_limit
+                and best not in eligible
+            ):
+                eligible.append(best)
 
         # First collapse high-overlap clusters. This specifically prevents
         # "same bus + same transfer + 300 m different bicycle approach" clones.
@@ -1375,7 +2495,16 @@ class RoutePlanner:
                 (
                     i
                     for i, rep in enumerate(representatives)
-                    if self._route_similarity(route, rep) >= 0.80
+                    if self._route_similarity(route, rep)
+                    >= (
+                        0.88
+                        if route.get("streetPreference")
+                        and rep.get("streetPreference")
+                        and route.get("streetPreference") != rep.get("streetPreference")
+                        else 0.80
+                        if route.get("strategyGroup") == rep.get("strategyGroup")
+                        else 0.88
+                    )
                 ),
                 None,
             )
@@ -1384,7 +2513,27 @@ class RoutePlanner:
             else:
                 rep = representatives[cluster_index]
                 if (route["score"], route["doorToDoor"]) < (rep["score"], rep["doorToDoor"]):
+                    route["archetypes"] = list(
+                        dict.fromkeys(
+                            (route.get("archetypes") or []) + (rep.get("archetypes") or [])
+                        )
+                    )
                     representatives[cluster_index] = route
+                else:
+                    rep["archetypes"] = list(
+                        dict.fromkeys(
+                            (rep.get("archetypes") or []) + (route.get("archetypes") or [])
+                        )
+                    )
+                if diagnostics:
+                    diagnostics.clustered += 1
+                    diagnostics.event(
+                        "candidate_clustered",
+                        route,
+                        representative=RoutingDiagnostics._route_ref(
+                            representatives[cluster_index]
+                        ),
+                    )
 
         direct_bike = self._best_matching(routes, lambda r: r.get("kind") == "bike")
         if direct_bike is not None and all(id(x) != id(direct_bike) for x in representatives):
@@ -1392,34 +2541,90 @@ class RoutePlanner:
 
         selected: list[dict[str, Any]] = []
 
-        def add(route: dict[str, Any] | None, force: bool = False) -> None:
+        def add(
+            route: dict[str, Any] | None,
+            force: bool = False,
+            preserve_strategy: bool = False,
+        ) -> None:
             if route is None or len(selected) >= limit or route in selected:
                 return
-            if not force and route.get("kind") != "bike" and float(route["doorToDoor"]) > soft_limit:
+            if (
+                not force
+                and not preserve_strategy
+                and route.get("kind") != "bike"
+                and float(route["doorToDoor"]) > soft_limit
+            ):
                 return
             max_sim = max((self._route_similarity(route, x) for x in selected), default=0.0)
-            if not force and max_sim >= 0.84:
+            if not force and max_sim >= (0.91 if preserve_strategy else 0.88):
                 return
             selected.append(route)
+            if diagnostics:
+                diagnostics.event(
+                    "candidate_selected",
+                    route,
+                    reason="archetype" if preserve_strategy else "rank_or_diversity",
+                )
 
-        # Archetypes are filled before generic MMR. Each slot still passes the
-        # similarity gate, so labels correspond to genuinely different strategies.
-        add(min(representatives, key=lambda r: r["doorToDoor"]))
-        add(min(representatives, key=lambda r: (r["score"], r["doorToDoor"])))
-        add(self._best_matching(representatives, lambda r: r.get("strategy") == "boarding_anchor"))
-        add(self._best_matching(representatives, lambda r: r.get("strategy") == "egress_anchor"))
-        add(self._best_matching(representatives, lambda r: "RAIL" in r.get("transitModes", [])))
-        add(
-            min(
-                representatives,
-                key=lambda r: (int(r.get("transfers") or 0), r["score"]),
+        # Archetypes are reserved before MMR.  Focus changes the reservation
+        # order, so extreme slider values remain structurally different.
+        if route_focus <= -1:
+            archetype_order = (
+                "FASTEST",
+                "TRANSIT_HEAVY",
+                "TRUNK_ACCESS",
+                "RAIL",
+                "LOW_TRANSFER",
+                "BALANCED",
+                "DIRECT_BIKE",
+                "BIKE_CYCLEWAY",
+                "BIKE_DIRECT",
+                "BIKE_QUIET",
+                "EARLY_EGRESS",
             )
-            if representatives
-            else None
-        )
-        add(direct_bike, force=True)
+        elif route_focus >= 1:
+            archetype_order = (
+                "FASTEST",
+                "BIKE_HEAVY",
+                "DIRECT_BIKE",
+                "BIKE_CYCLEWAY",
+                "BIKE_DIRECT",
+                "BIKE_QUIET",
+                "TRUNK_ACCESS",
+                "RAIL",
+                "EARLY_EGRESS",
+                "BALANCED",
+                "LOW_TRANSFER",
+            )
+        else:
+            archetype_order = (
+                "FASTEST",
+                "BALANCED",
+                "TRUNK_ACCESS",
+                "RAIL",
+                "LOW_TRANSFER",
+                "EARLY_EGRESS",
+                "BIKE_HEAVY",
+                "TRANSIT_HEAVY",
+                "DIRECT_BIKE",
+                "BIKE_CYCLEWAY",
+                "BIKE_DIRECT",
+                "BIKE_QUIET",
+            )
+        mandatory = {"DIRECT_BIKE", "BIKE_DIRECT", "BIKE_CYCLEWAY"}
+        if route_focus <= -1:
+            mandatory.update({"TRANSIT_HEAVY", "TRUNK_ACCESS", "RAIL"})
+        elif route_focus >= 1:
+            mandatory.add("BIKE_HEAVY")
 
-        lambda_similarity = { -2: 300.0, -1: 330.0, 0: 360.0, 1: 390.0, 2: 420.0 }[route_focus]
+        # Keep the stable direct-bike baseline independently of focus.  It may
+        # still sort below another recommendation after all scores are applied.
+        add(direct_bike, force=True, preserve_strategy=True)
+        for archetype in archetype_order:
+            route = self._best_for_archetype(representatives, archetype)
+            add(route, force=archetype == "DIRECT_BIKE", preserve_strategy=archetype in mandatory)
+
+        lambda_similarity = 360.0 * (0.90 + 0.10 * abs(route_focus))
         while len(selected) < limit:
             remaining = [r for r in representatives if r not in selected]
             if not remaining:
@@ -1430,12 +2635,49 @@ class RoutePlanner:
                 diversity_cost = float(route["score"]) + lambda_similarity * max_sim
                 scored.append((diversity_cost, max_sim, float(route["doorToDoor"]), route))
             scored.sort(key=lambda item: (item[0], item[1], item[2]))
-            chosen = next((item[3] for item in scored if item[1] < 0.86), None)
+            chosen = next((item[3] for item in scored if item[1] < 0.88), None)
             if chosen is None:
                 break
+            before_add = len(selected)
             add(chosen)
+            if len(selected) == before_add:
+                break
 
-        selected.sort(key=lambda r: (r["score"], r["doorToDoor"]))
+        # A single-card result is especially unhelpful for a mixed navigator.
+        # If strategy clustering was too aggressive, restore the best remaining
+        # real candidate (prefer another bicycle street hypothesis) rather than
+        # returning only one all-bicycle answer.
+        minimum_target = min(
+            focus_cfg.minimum_result_strategies,
+            limit,
+            len(representatives),
+        )
+        while len(selected) < minimum_target:
+            remaining = [route for route in representatives if route not in selected]
+            if not remaining:
+                break
+            existing_preferences = {
+                route.get("streetPreference") for route in selected if route.get("streetPreference")
+            }
+            remaining.sort(
+                key=lambda route: (
+                    route.get("strategyGroup")
+                    in {item.get("strategyGroup") for item in selected},
+                    route.get("streetPreference") in existing_preferences,
+                    route.get("score", math.inf),
+                    route.get("doorToDoor", math.inf),
+                )
+            )
+            restored = remaining[0]
+            selected.append(restored)
+            if diagnostics:
+                diagnostics.event(
+                    "candidate_selected",
+                    restored,
+                    reason="minimum_strategy_count",
+                )
+
+        selected.sort(key=self._stable_route_key)
         for index, route in enumerate(selected):
             route["id"] = f"route-{index}"
             route["diversity"] = {
@@ -1447,6 +2689,8 @@ class RoutePlanner:
                     3,
                 )
             }
+        if diagnostics:
+            diagnostics.selected = len(selected)
         return selected
 
     def _route_similarity(self, a: dict[str, Any], b: dict[str, Any]) -> float:
@@ -1465,10 +2709,34 @@ class RoutePlanner:
             set(self._transit_chain_signature(a)),
             set(self._transit_chain_signature(b)),
         )
-        transit_overlap = 0.75 * transit_corridor + 0.25 * line_overlap
+        mode_overlap = self._set_overlap(
+            set(a.get("transitModes") or [leg.get("mode") for leg in a.get("legs") or [] if leg.get("transitLeg")]),
+            set(b.get("transitModes") or [leg.get("mode") for leg in b.get("legs") or [] if leg.get("transitLeg")]),
+        )
+        transit_overlap = 0.55 * transit_corridor + 0.25 * line_overlap + 0.20 * mode_overlap
         bike_overlap = self._set_overlap(a_bike, b_bike)
         transfer_overlap = self._set_overlap(self._transfer_stops(a), self._transfer_stops(b))
-        return max(0.0, min(1.0, 0.60 * transit_overlap + 0.25 * bike_overlap + 0.15 * transfer_overlap))
+        endpoint_overlap = self._set_overlap(
+            self._boarding_egress_stops(a),
+            self._boarding_egress_stops(b),
+        )
+        strategy_overlap = (
+            1.0
+            if a.get("strategyArchetype")
+            and a.get("strategyArchetype") == b.get("strategyArchetype")
+            else 0.0
+        )
+        return max(
+            0.0,
+            min(
+                1.0,
+                0.48 * transit_overlap
+                + 0.20 * bike_overlap
+                + 0.12 * transfer_overlap
+                + 0.10 * endpoint_overlap
+                + 0.10 * strategy_overlap,
+            ),
+        )
 
     @staticmethod
     def _set_overlap(a: set, b: set) -> float:
@@ -1503,6 +2771,16 @@ class RoutePlanner:
         return {s for s in stops if s}
 
     @staticmethod
+    def _boarding_egress_stops(route: dict[str, Any]) -> set[str]:
+        transit = [leg for leg in route.get("legs") or [] if leg.get("transitLeg")]
+        if not transit:
+            return set()
+        return {
+            str((transit[0].get("from") or {}).get("name") or ""),
+            str((transit[-1].get("to") or {}).get("name") or ""),
+        } - {""}
+
+    @staticmethod
     def _transit_chain_signature(route: dict[str, Any]) -> tuple[str, ...]:
         result: list[str] = []
         for leg in route.get("legs") or []:
@@ -1530,15 +2808,21 @@ class RoutePlanner:
                 label = "Самый быстрый"
             elif route is optimal:
                 label = "Оптимальный баланс"
-            elif route.get("strategy") == "boarding_anchor":
+            elif "TRUNK_ACCESS" in (route.get("archetypes") or []):
                 label = "Велосипед к сильной линии"
             elif route.get("strategy") == "egress_anchor":
                 label = "Ранний выход → велосипед"
             elif route is min_transfers and route.get("kind") == "mixed":
                 label = "Меньше пересадок"
+            elif "BIKE_CYCLEWAY" in (route.get("archetypes") or []):
+                label = "По велодорожкам"
+            elif "BIKE_DIRECT" in (route.get("archetypes") or []):
+                label = "Более прямой веломаршрут"
+            elif "BIKE_QUIET" in (route.get("archetypes") or []):
+                label = "Тихий веломаршрут"
             elif route.get("kind") == "bike":
                 label = "Только велосипед"
-            elif "RAIL" in route.get("transitModes", []):
+            elif set(route.get("transitModes", [])).intersection({"RAIL", "SUBWAY"}):
                 label = "Поезд + велосипед"
             elif float(route.get("bestTrunkScore") or 0) >= 0.68:
                 label = "Сильный транспортный коридор"
@@ -1571,9 +2855,21 @@ class RoutePlanner:
                     + (f" · ≈{round(saved / 60)} мин экономии" if saved >= 60 else "")
                 )
 
+            protected_feeder = next(
+                (
+                    item
+                    for item in optimization.get("transitLegDecisions") or []
+                    if item.get("reason") == "scheduled_connection_protected"
+                ),
+                None,
+            )
+            if protected_feeder:
+                route_name = protected_feeder.get("route") or protected_feeder.get("mode") or "ОТ"
+                notes.append(f"{route_name} сохранён, чтобы успеть на следующий рейс")
+
             if float(route.get("bestTrunkScore") or 0) >= 0.68 and route.get("bestTrunkRoute"):
                 notes.append(f"Используется сильная линия {route['bestTrunkRoute']}")
-            if route.get("kind") == "mixed" and int(route.get("transfers") or 0) == 0:
+            if route.get("kind") == "mixed" and int(route.get("transitTransfers") or 0) == 0:
                 notes.append("Без пересадок между маршрутами ОТ")
             route["explanations"] = notes[:3]
 
@@ -1592,6 +2888,19 @@ class RoutePlanner:
             if self.gtfs.bike_allowed_for_trip(leg.get("tripId")) == 2:
                 return False
         return True
+
+    @staticmethod
+    def _candidate_is_valid(route: dict[str, Any]) -> bool:
+        legs = route.get("legs") or []
+        if not legs or float(route.get("doorToDoor") or 0) <= 0:
+            return False
+        if any(str(leg.get("mode") or "").upper() in {"CAR", "MOTORCYCLE"} for leg in legs):
+            return False
+        return all(
+            int(leg.get("duration") or 0) >= 0
+            and float(leg.get("distance") or 0) >= 0
+            for leg in legs
+        )
 
     @staticmethod
     def _parse_leg_timestamp(value: Any) -> datetime | None:
@@ -1644,6 +2953,11 @@ class RoutePlanner:
                     replaced.append(previous.pop("replaces"))
                 if leg.get("replaces"):
                     replaced.append(leg.get("replaces"))
+                manual_replacements = previous.setdefault("manualReplacements", [])
+                if previous.get("manualReplacement"):
+                    manual_replacements.append(previous.pop("manualReplacement"))
+                if leg.get("manualReplacement"):
+                    manual_replacements.append(deepcopy(leg.get("manualReplacement")))
             else:
                 result.append(leg)
         return result
@@ -1651,6 +2965,10 @@ class RoutePlanner:
     def _dedupe_exact(self, routes: list[dict[str, Any]]) -> list[dict[str, Any]]:
         best: dict[tuple, dict[str, Any]] = {}
         for route in routes:
+            route.setdefault(
+                "candidateFamilies",
+                [str(route.get("sourceQuery") or route.get("strategy") or "unknown")],
+            )
             key = self._exact_signature(route)
             previous = best.get(key)
             if previous is None or (
@@ -1660,12 +2978,32 @@ class RoutePlanner:
                 float(previous.get("score") or math.inf),
                 float(previous.get("doorToDoor") or math.inf),
             ):
+                if previous is not None:
+                    route["candidateFamilies"] = list(
+                        dict.fromkeys(
+                            (route.get("candidateFamilies") or [])
+                            + (previous.get("candidateFamilies") or [])
+                        )
+                    )
                 best[key] = route
+            elif previous is not None:
+                previous["candidateFamilies"] = list(
+                    dict.fromkeys(
+                        (previous.get("candidateFamilies") or [])
+                        + (route.get("candidateFamilies") or [])
+                    )
+                )
+                special = {"trunk_access": 0, "boarding_anchor": 1, "egress_anchor": 1}
+                if special.get(str(route.get("strategy")), 99) < special.get(
+                    str(previous.get("strategy")), 99
+                ):
+                    previous["strategy"] = route.get("strategy")
+                    previous["anchor"] = deepcopy(route.get("anchor"))
         return list(best.values())
 
     @staticmethod
     def _exact_signature(route: dict[str, Any]) -> tuple:
-        return tuple(
+        legs_signature = tuple(
             (
                 leg.get("mode"),
                 (leg.get("route") or {}).get("shortName") or (leg.get("route") or {}).get("longName"),
@@ -1675,6 +3013,9 @@ class RoutePlanner:
             )
             for leg in route.get("legs") or []
         )
+        if route.get("streetPreference"):
+            return (("BIKE_STRATEGY", route.get("streetPreference")),) + legs_signature
+        return legs_signature
 
     @staticmethod
     def _dedupe_warnings(warnings: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1694,7 +3035,50 @@ class RoutePlanner:
         predicate: Callable[[dict[str, Any]], bool],
     ) -> dict[str, Any] | None:
         matches = [route for route in routes if predicate(route)]
-        return min(matches, key=lambda r: (r.get("score", math.inf), r.get("doorToDoor", math.inf))) if matches else None
+        return min(matches, key=RoutePlanner._stable_route_key) if matches else None
+
+    @staticmethod
+    def _best_for_archetype(
+        routes: list[dict[str, Any]],
+        archetype: str,
+    ) -> dict[str, Any] | None:
+        matches = [r for r in routes if archetype in (r.get("archetypes") or [])]
+        if not matches:
+            return None
+        if archetype == "FASTEST":
+            return min(
+                matches,
+                key=lambda r: (
+                    r.get("doorToDoor", math.inf),
+                    RoutePlanner._stable_route_key(r),
+                ),
+            )
+        if archetype == "LOW_TRANSFER":
+            return min(
+                matches,
+                key=lambda r: (
+                    r.get("transfers", math.inf),
+                    r.get("score", math.inf),
+                    r.get("doorToDoor", math.inf),
+                ),
+            )
+        return min(matches, key=RoutePlanner._stable_route_key)
+
+    @staticmethod
+    def _stable_route_key(route: dict[str, Any]) -> tuple:
+        preference_rank = {
+            "cycleway": 0,
+            "direct": 1,
+            "quiet": 2,
+        }.get(route.get("streetPreference"), 3)
+        return (
+            route.get("score", math.inf),
+            route.get("doorToDoor", math.inf),
+            preference_rank,
+            str(route.get("strategy") or ""),
+            str(route.get("sourceQuery") or ""),
+            tuple(route.get("transitRoutes") or []),
+        )
 
     @staticmethod
     def _clamp_int(value: Any, low: int, high: int, default: int) -> int:

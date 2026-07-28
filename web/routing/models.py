@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -8,90 +9,294 @@ MOSCOW_TZ = ZoneInfo("Europe/Moscow")
 
 PROFILE_CONFIG = {
     "fast": {
-        "name": "Быстро",
-        "speed_kmh": 14.0,
-        "speed_mps": 14.0 / 3.6,
-        "transit_replace_max_bike_distance": 2000,
-        "transit_replace_max_bike_duration": 480,
-        "transit_replace_min_saving": 120,
-        "triangle": {"time": 0.75, "safety": 0.20, "flatness": 0.05},
-        "transfer_penalty": 150,
-        "bike_boarding_penalty": 75,
-        "wait_factor": 0.25,
-    },
-    "balanced": {
-        "name": "Баланс",
+        "name": "Прямее",
         "speed_kmh": 11.0,
         "speed_mps": 11.0 / 3.6,
         "transit_replace_max_bike_distance": 1500,
         "transit_replace_max_bike_duration": 420,
         "transit_replace_min_saving": 150,
-        "triangle": {"time": 0.50, "safety": 0.40, "flatness": 0.10},
+        # "Direct" is only relative to the other bicycle variants: safety still
+        # dominates, and the OTP street mode remains BICYCLE.
+        "triangle": {"time": 0.35, "safety": 0.60, "flatness": 0.05},
+        "transfer_penalty": 240,
+        "bike_boarding_penalty": 120,
+        "wait_factor": 0.35,
+    },
+    "balanced": {
+        "name": "По велодорожкам",
+        "speed_kmh": 11.0,
+        "speed_mps": 11.0 / 3.6,
+        "transit_replace_max_bike_distance": 1500,
+        "transit_replace_max_bike_duration": 420,
+        "transit_replace_min_saving": 150,
+        "triangle": {"time": 0.13, "safety": 0.82, "flatness": 0.05},
         "transfer_penalty": 240,
         "bike_boarding_penalty": 120,
         "wait_factor": 0.35,
     },
     "calm": {
-        "name": "Спокойно",
-        "speed_kmh": 8.5,
-        "speed_mps": 8.5 / 3.6,
-        "transit_replace_max_bike_distance": 1200,
-        "transit_replace_max_bike_duration": 360,
-        "transit_replace_min_saving": 180,
-        "triangle": {"time": 0.30, "safety": 0.60, "flatness": 0.10},
-        "transfer_penalty": 300,
-        "bike_boarding_penalty": 150,
-        "wait_factor": 0.40,
+        "name": "Тихий маршрут",
+        "speed_kmh": 11.0,
+        "speed_mps": 11.0 / 3.6,
+        "transit_replace_max_bike_distance": 1500,
+        "transit_replace_max_bike_duration": 420,
+        "transit_replace_min_saving": 150,
+        "triangle": {"time": 0.05, "safety": 0.90, "flatness": 0.05},
+        "transfer_penalty": 240,
+        "bike_boarding_penalty": 120,
+        "wait_factor": 0.35,
     },
 }
 
+DEFAULT_PROFILE = "balanced"
 
-ROUTE_FOCUS_CONFIG = {
-    -2: {
-        "key": "transit",
-        "name": "Больше транспорта",
-        "bike_share_shift": -0.20,
-        "share_penalty_seconds": 1500,
-        "transfer_penalty_factor": 0.70,
-        "time_tolerance_ratio": 0.30,
-        "anchor_limit": 9,
+# Internal street-routing hypotheses.  They are generated together; this is no
+# longer a user-selected journey style.
+BICYCLE_ROUTE_VARIANTS = (
+    {
+        "key": "direct",
+        "name": "Прямой веломаршрут",
+        "otp_profile": "fast",
+        "strategy": "bike_direct",
     },
-    -1: {
-        "key": "transit_lean",
-        "name": "Скорее транспорт",
-        "bike_share_shift": -0.10,
-        "share_penalty_seconds": 1200,
-        "transfer_penalty_factor": 0.85,
-        "time_tolerance_ratio": 0.25,
-        "anchor_limit": 10,
+    {
+        "key": "cycleway",
+        "name": "По велодорожкам",
+        "otp_profile": "balanced",
+        "strategy": "bike_cycleway",
     },
-    0: {
-        "key": "balanced",
-        "name": "Баланс",
-        "bike_share_shift": 0.0,
-        "share_penalty_seconds": 900,
-        "transfer_penalty_factor": 1.0,
-        "time_tolerance_ratio": 0.25,
-        "anchor_limit": 12,
+    {
+        "key": "quiet",
+        "name": "Тихий веломаршрут",
+        "otp_profile": "calm",
+        "strategy": "bike_quiet",
     },
-    1: {
-        "key": "bike_lean",
-        "name": "Больше велосипеда",
-        "bike_share_shift": 0.15,
-        "share_penalty_seconds": 1200,
-        "transfer_penalty_factor": 1.15,
-        "time_tolerance_ratio": 0.38,
-        "anchor_limit": 14,
-    },
-    2: {
-        "key": "ride",
-        "name": "Велопрогулка",
-        "bike_share_shift": 0.30,
-        "share_penalty_seconds": 1500,
-        "transfer_penalty_factor": 1.30,
-        "time_tolerance_ratio": 0.55,
-        "anchor_limit": 16,
-    },
+)
+
+
+@dataclass(frozen=True)
+class RouteFocusConfig:
+    """One coherent set of behavioural knobs for the route-focus axis.
+
+    These values are deliberately expressed as distances, perceived-time
+    multipliers and candidate budgets.  The planner can therefore use the same
+    preference during generation, segment optimisation, scoring and selection
+    instead of accumulating unrelated ``if route_focus == ...`` branches.
+    """
+
+    key: str
+    name: str
+    bike_cost_factor: float
+    transit_cost_factor: float
+    max_bike_access_m: float
+    max_bike_egress_m: float
+    access_target_m: float
+    egress_target_m: float
+    target_bike_share_shift: float
+    share_penalty_seconds: float
+    short_transit_penalty_factor: float
+    transfer_penalty_factor: float
+    feeder_protection: float
+    trunk_access_bonus_factor: float
+    min_transit_utility_seconds: float
+    max_replacement_bike_seconds: int
+    time_tolerance_ratio: float
+    time_tolerance_seconds: int
+    anchor_limit: int
+    otp_candidates_per_query: int
+    transit_skeleton_limit: int
+    transfer_reduction: int
+    generic_mode_families: tuple[str, ...]
+    transit_departure_offsets_min: tuple[int, ...]
+    transit_transfer_caps: tuple[int, ...]
+    optimizer_focus_variants: tuple[int, ...]
+    minimum_result_strategies: int
+
+
+ROUTE_FOCUS_CONFIG: dict[int, RouteFocusConfig] = {
+    -2: RouteFocusConfig(
+        key="transit",
+        name="Больше транспорта",
+        bike_cost_factor=1.32,
+        transit_cost_factor=0.76,
+        max_bike_access_m=1_800,
+        max_bike_egress_m=4_500,
+        access_target_m=600,
+        egress_target_m=1_300,
+        target_bike_share_shift=-0.24,
+        share_penalty_seconds=2_400,
+        short_transit_penalty_factor=0.60,
+        transfer_penalty_factor=0.72,
+        feeder_protection=1.45,
+        trunk_access_bonus_factor=1.45,
+        min_transit_utility_seconds=-120,
+        max_replacement_bike_seconds=9 * 60,
+        time_tolerance_ratio=0.32,
+        time_tolerance_seconds=12 * 60,
+        anchor_limit=10,
+        otp_candidates_per_query=24,
+        transit_skeleton_limit=50,
+        transfer_reduction=0,
+        generic_mode_families=(
+            "all",
+            "bus",
+            "tram",
+            "rail",
+            "bus_tram",
+            "bus_rail",
+            "tram_rail",
+        ),
+        transit_departure_offsets_min=(0, 8),
+        transit_transfer_caps=(4, 2),
+        optimizer_focus_variants=(-2, -1),
+        minimum_result_strategies=6,
+    ),
+    -1: RouteFocusConfig(
+        key="transit_lean",
+        name="Скорее транспорт",
+        bike_cost_factor=1.08,
+        transit_cost_factor=0.94,
+        max_bike_access_m=3_000,
+        max_bike_egress_m=8_000,
+        access_target_m=1_250,
+        egress_target_m=2_800,
+        target_bike_share_shift=-0.12,
+        share_penalty_seconds=1_300,
+        short_transit_penalty_factor=0.80,
+        transfer_penalty_factor=0.86,
+        feeder_protection=1.20,
+        trunk_access_bonus_factor=1.22,
+        min_transit_utility_seconds=-55,
+        max_replacement_bike_seconds=12 * 60,
+        time_tolerance_ratio=0.27,
+        time_tolerance_seconds=12 * 60,
+        anchor_limit=11,
+        otp_candidates_per_query=22,
+        transit_skeleton_limit=46,
+        transfer_reduction=0,
+        generic_mode_families=(
+            "all",
+            "bus",
+            "tram",
+            "rail",
+            "bus_tram",
+            "bus_rail",
+            "tram_rail",
+        ),
+        transit_departure_offsets_min=(0, 10),
+        transit_transfer_caps=(4, 2),
+        optimizer_focus_variants=(-2, -1, 0),
+        minimum_result_strategies=6,
+    ),
+    0: RouteFocusConfig(
+        key="auto",
+        name="Все стратегии",
+        bike_cost_factor=1.0,
+        transit_cost_factor=1.0,
+        max_bike_access_m=8_000,
+        max_bike_egress_m=16_000,
+        access_target_m=2_800,
+        egress_target_m=6_000,
+        target_bike_share_shift=0.0,
+        share_penalty_seconds=700,
+        short_transit_penalty_factor=1.0,
+        transfer_penalty_factor=1.0,
+        feeder_protection=1.0,
+        trunk_access_bonus_factor=1.0,
+        min_transit_utility_seconds=20,
+        max_replacement_bike_seconds=16 * 60,
+        time_tolerance_ratio=0.55,
+        time_tolerance_seconds=35 * 60,
+        anchor_limit=24,
+        otp_candidates_per_query=24,
+        transit_skeleton_limit=64,
+        transfer_reduction=0,
+        generic_mode_families=(
+            "all",
+            "bus",
+            "tram",
+            "rail",
+            "bus_tram",
+            "bus_rail",
+            "tram_rail",
+        ),
+        transit_departure_offsets_min=(0, 8, 16),
+        transit_transfer_caps=(4, 2, 1, 0),
+        optimizer_focus_variants=(-2, -1, 0, 1, 2),
+        minimum_result_strategies=10,
+    ),
+    1: RouteFocusConfig(
+        key="bike_lean",
+        name="Больше велосипеда",
+        bike_cost_factor=0.82,
+        transit_cost_factor=1.12,
+        max_bike_access_m=5_200,
+        max_bike_egress_m=12_000,
+        access_target_m=2_800,
+        egress_target_m=6_000,
+        target_bike_share_shift=0.22,
+        share_penalty_seconds=1_700,
+        short_transit_penalty_factor=1.35,
+        transfer_penalty_factor=1.20,
+        feeder_protection=0.90,
+        trunk_access_bonus_factor=1.12,
+        min_transit_utility_seconds=80,
+        max_replacement_bike_seconds=22 * 60,
+        time_tolerance_ratio=0.40,
+        time_tolerance_seconds=23 * 60,
+        anchor_limit=15,
+        otp_candidates_per_query=18,
+        transit_skeleton_limit=38,
+        transfer_reduction=1,
+        generic_mode_families=(
+            "all",
+            "bus",
+            "tram",
+            "rail",
+            "bus_rail",
+            "tram_rail",
+        ),
+        transit_departure_offsets_min=(0, 12),
+        transit_transfer_caps=(4, 1, 0),
+        optimizer_focus_variants=(0, 1, 2),
+        minimum_result_strategies=6,
+    ),
+    2: RouteFocusConfig(
+        key="ride",
+        name="Велопрогулка",
+        bike_cost_factor=0.62,
+        transit_cost_factor=1.30,
+        max_bike_access_m=8_000,
+        max_bike_egress_m=16_000,
+        access_target_m=4_800,
+        egress_target_m=9_500,
+        target_bike_share_shift=0.42,
+        share_penalty_seconds=2_500,
+        short_transit_penalty_factor=1.75,
+        transfer_penalty_factor=1.42,
+        feeder_protection=0.82,
+        trunk_access_bonus_factor=1.20,
+        min_transit_utility_seconds=200,
+        max_replacement_bike_seconds=40 * 60,
+        time_tolerance_ratio=0.58,
+        time_tolerance_seconds=32 * 60,
+        anchor_limit=18,
+        otp_candidates_per_query=16,
+        transit_skeleton_limit=46,
+        transfer_reduction=1,
+        generic_mode_families=(
+            "all",
+            "bus",
+            "tram",
+            "rail",
+            "bus_rail",
+            "tram_rail",
+        ),
+        transit_departure_offsets_min=(0, 12),
+        transit_transfer_caps=(4, 1, 0),
+        optimizer_focus_variants=(1, 2),
+        minimum_result_strategies=6,
+    ),
 }
 
 

@@ -12,7 +12,7 @@ from typing import Any
 
 from flask import Flask, jsonify, render_template, request
 
-from routing.planner import RoutePlanner
+from routing.planner import RouteEditConflict, RoutePlanner
 
 app = Flask(__name__)
 
@@ -129,6 +129,19 @@ def routes():
         body = request.get_json(force=True, silent=False) or {}
         result = planner.plan(body)
         return jsonify({**result, "otpUrl": OTP_URL})
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 502
+
+
+@app.post("/api/routes/replace-with-bicycle")
+def replace_route_with_bicycle():
+    try:
+        body = request.get_json(force=True, silent=False) or {}
+        return jsonify(planner.replace_with_bicycle(body))
+    except RouteEditConflict as exc:
+        return jsonify({"error": str(exc), "code": "MISSED_CONNECTION"}), 409
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
     except Exception as exc:

@@ -4,6 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
   <title>Смешанный навигатор</title>
+  <link rel="icon" href="data:,">
   <link rel="stylesheet" href="https://unpkg.com/maplibre-gl@6.0.0/dist/maplibre-gl.css">
   <link rel="stylesheet" href="/static/style.css">
 </head>
@@ -20,6 +21,11 @@
       </header>
 
       <section class="planner-card">
+        <div class="mobile-planner-handle" aria-hidden="true"></div>
+        <div class="mobile-planner-title">Новый маршрут</div>
+        <button id="mobile-close-search" class="mobile-close-search" type="button">
+          ← К карте
+        </button>
         <div class="location-block">
           <div class="location-rail">
             <span class="location-dot origin-dot"></span>
@@ -63,94 +69,6 @@
             <label for="departure">Отправление</label>
             <input id="departure" type="datetime-local">
           </div>
-          <div>
-            <label for="max-transfers">Пересадки</label>
-            <select id="max-transfers">
-              <option value="2" selected>до 2</option>
-              <option value="3">до 3</option>
-              <option value="4">до 4</option>
-              <option value="5">до 5</option>
-            </select>
-            <span class="control-hint">Только смены ОТ; велосипед не считается.</span>
-          </div>
-        </div>
-
-        <div class="settings-wrap">
-          <button id="settings-button" class="settings-button" type="button" aria-expanded="false">
-            <span class="settings-button-icon">⚙</span>
-            <span class="settings-button-copy">
-              <span class="settings-button-label">Настройки поездки</span>
-              <span id="profile-summary" class="settings-button-value">Баланс · ~11 км/ч · маршрут: баланс</span>
-            </span>
-            <span class="settings-chevron">⌄</span>
-          </button>
-
-          <div id="settings-panel" class="settings-panel hidden">
-            <div class="settings-title">Стиль поездки</div>
-            <div class="settings-subtitle">
-              Средняя скорость учитывает городской ритм: светофоры, переходы, разгоны и остановки.
-            </div>
-
-            <div id="profile-selector" class="profile-options">
-              <button class="profile-option" data-profile="fast" type="button">
-                <span class="profile-option-top">
-                  <strong>Быстро</strong>
-                  <span>~14 км/ч средняя</span>
-                </span>
-                <span class="profile-option-description">
-                  Уверенный городской темп. Около 14 км/ч в среднем по маршруту с учётом остановок.
-                </span>
-              </button>
-
-              <button class="profile-option active" data-profile="balanced" type="button">
-                <span class="profile-option-top">
-                  <strong>Баланс</strong>
-                  <span>~11 км/ч средняя</span>
-                </span>
-                <span class="profile-option-description">
-                  Обычная городская поездка. Около 11 км/ч в среднем с учётом светофоров и переходов.
-                </span>
-              </button>
-
-              <button class="profile-option" data-profile="calm" type="button">
-                <span class="profile-option-top">
-                  <strong>Спокойно</strong>
-                  <span>~8.5 км/ч средняя</span>
-                </span>
-                <span class="profile-option-description">
-                  Спокойная поездка без спешки. Около 8.5 км/ч в среднем и больший приоритет тихих улиц.
-                </span>
-              </button>
-            </div>
-
-            <div class="settings-divider"></div>
-
-            <div class="settings-title">Упор маршрута</div>
-            <div class="settings-subtitle">
-              Это не жёсткая доля. Алгоритм учитывает длину поездки и сам выбирает разумный баланс.
-            </div>
-
-            <div class="route-focus-control">
-              <input id="route-focus" type="range" min="-2" max="2" step="1" value="0">
-              <div class="route-focus-scale" aria-hidden="true">
-                <span>ОТ</span>
-                <span>Баланс</span>
-                <span>Вело</span>
-              </div>
-              <div class="route-focus-card">
-                <strong id="route-focus-name">Баланс</strong>
-                <span id="route-focus-description">
-                  Время остаётся главным фактором, но алгоритм старается сохранять разумную долю велосипеда.
-                </span>
-              </div>
-            </div>
-          </div>
-        </div>
-
-        <div class="planner-meta">
-          <span>Велосипед с собой</span>
-          <span>•</span>
-          <span>Метро исключено</span>
         </div>
 
         <button id="route-button" class="primary-button" type="button">Построить маршрут</button>
@@ -158,19 +76,10 @@
       </section>
 
       <section class="results-section">
-        <div class="results-header">
-          <div>
-            <div class="results-title">Варианты</div>
-            <div id="results-summary" class="results-summary">Выберите две точки</div>
-          </div>
-          <button id="clear-button" class="text-button" type="button">Сбросить</button>
+        <div class="results-sheet-top">
+          <div class="results-sheet-handle" aria-hidden="true"></div>
+          <button id="clear-button" class="results-clear-button" type="button" aria-label="Сбросить маршрут">×</button>
         </div>
-
-        <div id="loading" class="loading hidden">
-          <span class="spinner"></span>
-          <span>Считаю варианты…</span>
-        </div>
-
         <div id="warnings" class="warnings hidden"></div>
         <div id="route-list" class="route-list"></div>
       </section>
@@ -178,11 +87,111 @@
 
     <main class="map-wrap">
       <div id="map"></div>
-      <div id="map-hint" class="map-hint">Нажмите на карту, чтобы поставить старт</div>
+      <div id="map-hint" class="map-hint hidden"></div>
+      <button id="mobile-open-planner" class="mobile-open-planner" type="button">
+        Построить маршрут
+      </button>
+      <div id="loading" class="routing-loader hidden" role="status" aria-live="polite">
+        <div class="routing-loader-card">
+          <svg class="penny-farthing" viewBox="0 0 200 116" aria-hidden="true">
+            <g class="penny-wheel-svg penny-wheel-big-svg">
+              <circle cx="58" cy="67" r="42"></circle>
+              <path d="M16 67h84M58 25v84M28 37l60 60M88 37L28 97"></path>
+              <circle class="penny-hub" cx="58" cy="67" r="3"></circle>
+            </g>
+            <g class="penny-wheel-svg penny-wheel-small-svg">
+              <circle cx="153" cy="92" r="17"></circle>
+              <path d="M136 92h34M153 75v34M141 80l24 24M165 80l-24 24"></path>
+              <circle class="penny-hub" cx="153" cy="92" r="2.5"></circle>
+            </g>
+            <g class="penny-frame-svg">
+              <path d="M58 67L91 18L153 92"></path>
+              <path d="M58 67l40-44"></path>
+              <path d="M91 18l-4-10m-7 0h15"></path>
+              <path class="penny-seat-svg" d="M77 22h18"></path>
+              <circle cx="58" cy="67" r="5"></circle>
+              <path class="penny-crank-svg" d="M58 67l8 7m-11-10l-7-7"></path>
+            </g>
+            <path class="penny-road-svg" d="M8 110h39m13 0h47m13 0h33m12 0h25"></path>
+          </svg>
+          <strong>Строим маршруты</strong>
+          <span id="loading-message">Сравниваем велосипед и транспорт</span>
+        </div>
+      </div>
+      <div id="mobile-route-bar" class="mobile-route-bar">
+        <button id="mobile-edit-search" type="button" aria-label="Изменить точки маршрута">←</button>
+        <div>
+          <strong>Изменить маршрут</strong>
+          <span>Точки и время отправления</span>
+        </div>
+      </div>
+      <section id="route-detail-panel" class="route-detail-panel hidden" aria-live="polite">
+        <div class="mobile-sheet-handle" aria-hidden="true"></div>
+        <div class="detail-header">
+          <div>
+            <div id="detail-label" class="detail-label">Маршрут</div>
+            <div class="detail-title-row">
+              <strong id="detail-duration">—</strong>
+              <span id="detail-arrival">—</span>
+            </div>
+          </div>
+          <button id="detail-overview" class="detail-overview-button" type="button">
+            Весь маршрут
+          </button>
+          <button id="detail-close" class="detail-close-button" type="button" aria-label="Закрыть подробности">×</button>
+        </div>
+
+        <div id="detail-badges" class="detail-badges"></div>
+        <div id="detail-explanations" class="detail-explanations"></div>
+
+        <div class="detail-actions">
+          <button id="route-edit-button" class="route-edit-button" type="button">
+            🚲 Заменить часть
+          </button>
+          <button id="route-edit-undo" class="route-undo-button hidden" type="button">
+            Отменить замену
+          </button>
+        </div>
+
+        <div id="route-edit-panel" class="route-edit-panel hidden">
+          <div class="route-edit-heading">
+            <strong>Велосипед вместо части маршрута</strong>
+            <span>Выберите две точки. Между ними будет построен новый безопасный веломаршрут.</span>
+          </div>
+          <div class="route-edit-fields">
+            <label>
+              <span>Откуда заменить</span>
+              <select id="route-edit-start"></select>
+            </label>
+            <label>
+              <span>До какой точки</span>
+              <select id="route-edit-end"></select>
+            </label>
+          </div>
+          <div id="route-edit-error" class="route-edit-error hidden" role="alert"></div>
+          <div class="route-edit-controls">
+            <button id="route-edit-cancel" type="button">Отмена</button>
+            <button id="route-edit-apply" type="button">Пересчитать на велосипеде</button>
+          </div>
+        </div>
+
+        <div class="detail-leg-nav">
+          <button id="detail-leg-prev" class="detail-nav-button" type="button" aria-label="Предыдущий участок">←</button>
+          <div class="detail-leg-copy">
+            <span id="detail-leg-position">Весь маршрут</span>
+            <strong id="detail-leg-title">Выберите участок</strong>
+            <span id="detail-leg-subtitle">Используйте стрелки или список ниже</span>
+          </div>
+          <button id="detail-leg-next" class="detail-nav-button" type="button" aria-label="Следующий участок">→</button>
+        </div>
+
+        <div id="detail-leg-steps" class="detail-leg-steps"></div>
+      </section>
       <div class="map-legend">
         <span><i class="legend-bike"></i>Велосипед</span>
         <span><i class="legend-transit"></i>Транспорт</span>
         <span><i class="legend-walk"></i>Пешком</span>
+        <span><i class="legend-transfer">1</i>Смена участка</span>
       </div>
     </main>
   </div>
