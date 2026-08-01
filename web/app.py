@@ -33,6 +33,20 @@ planner = RoutePlanner(
 )
 
 
+class OTPUnavailableError(RuntimeError):
+    pass
+
+
+def ensure_otp_available() -> None:
+    try:
+        if not planner.otp.health():
+            raise OTPUnavailableError("OTP ещё не готов принимать запросы.")
+    except OTPUnavailableError:
+        raise
+    except Exception as exc:
+        raise OTPUnavailableError(f"OTP недоступен: {exc}") from exc
+
+
 class LruCache:
     def __init__(self, max_size: int = 256) -> None:
         self.max_size = max_size
@@ -127,8 +141,16 @@ def health():
 def routes():
     try:
         body = request.get_json(force=True, silent=False) or {}
+        ensure_otp_available()
         result = planner.plan(body)
+        if not result.get("routes"):
+            # Candidate queries are intentionally isolated from one another in
+            # the planner. If OTP goes down during a request, those failures can
+            # otherwise look exactly like a valid empty search result.
+            ensure_otp_available()
         return jsonify({**result, "otpUrl": OTP_URL})
+    except OTPUnavailableError as exc:
+        return jsonify({"error": str(exc), "code": "OTP_UNAVAILABLE"}), 503
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
     except Exception as exc:

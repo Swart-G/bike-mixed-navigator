@@ -43,6 +43,7 @@ SOFT_ROUTING_ERRORS = {
     "NO_TRANSIT_CONNECTION_IN_SEARCH_WINDOW",
 }
 INTERNAL_MAX_TRANSIT_TRANSFERS = 4
+FINAL_ROUTE_LIMIT = 20
 
 
 class RouteEditConflict(ValueError):
@@ -247,7 +248,7 @@ class RoutePlanner:
         )
         selected = self._select_diverse(
             pareto,
-            limit=14,
+            limit=FINAL_ROUTE_LIMIT,
             route_focus=route_focus,
             diagnostics=diagnostics,
         )
@@ -264,7 +265,8 @@ class RoutePlanner:
             "genericCandidates": len(generic_routes),
             "transitSkeletonQueries": transit_stats["queries"],
             "transitSkeletons": transit_stats["skeletons"],
-            "transitOptimizedCandidates": len(transit_routes),
+            "transitOptimizedCandidates": transit_stats["optimizedCandidates"],
+            "publicTransportCandidates": transit_stats["publicTransportCandidates"],
             "optimizerFocusVariants": list(focus_cfg.optimizer_focus_variants),
             "bikeComparisons": transit_stats["bikeComparisons"],
             "anchorBikeComparisons": anchor_bike_comparisons,
@@ -685,7 +687,7 @@ class RoutePlanner:
                 (transit_legs[0].get("from") or {}).get("name") if transit_legs else None,
                 (transit_legs[-1].get("to") or {}).get("name") if transit_legs else None,
             )
-            if hypothesis in hypothesis_seen or chain_counts.get(chain, 0) >= 5:
+            if hypothesis in hypothesis_seen or chain_counts.get(chain, 0) >= 8:
                 continue
             hypothesis_seen.add(hypothesis)
             chain_counts[chain] = chain_counts.get(chain, 0) + 1
@@ -729,14 +731,33 @@ class RoutePlanner:
                 except Exception as exc:
                     warnings.append({"code": "TRANSIT_OPTIMIZER_FAILED", "description": str(exc)})
 
+        # Transit-first itineraries are useful results in their own right.  In
+        # the previous pipeline they were only optimizer input, which meant a
+        # valid all-/mostly-transit option could disappear after bicycle segment
+        # replacement. Keep one original candidate per real transit hypothesis.
+        public_transport: list[dict[str, Any]] = []
+        for skeleton in preselected:
+            candidate = deepcopy(skeleton)
+            candidate["strategy"] = "public_transport"
+            candidate.setdefault("candidateFamilies", []).append("public_transport")
+            candidate["optimization"] = {
+                "focusVariant": None,
+                "replacedWalkCount": 0,
+                "replacedTransitCount": 0,
+                "preservedTransitSkeleton": True,
+            }
+            public_transport.append(candidate)
+
         return (
-            self._dedupe_exact(optimized),
+            self._dedupe_exact(public_transport + optimized),
             self._dedupe_warnings(warnings),
             {
                 "queries": len(specs),
                 "skeletons": len(preselected),
                 "bikeComparisons": comparisons,
                 "optimizerRejected": max(0, len(preselected) - len(optimized)),
+                "optimizedCandidates": len(self._dedupe_exact(optimized)),
+                "publicTransportCandidates": len(self._dedupe_exact(public_transport)),
             },
         )
 
@@ -1774,6 +1795,9 @@ class RoutePlanner:
             "commercialSpeedKmh": round(metrics.commercial_speed_kmh, 1) if metrics.commercial_speed_kmh else None,
             "bikesAllowedRatio": round(metrics.bikes_allowed_ratio, 3) if metrics.bikes_allowed_ratio is not None else None,
             "trunkScore": round(metrics.trunk_score, 3),
+            "routeName": metrics.route_name,
+            "busServiceClass": metrics.bus_service_class,
+            "busPriorityScore": round(metrics.bus_priority_score, 3),
         }
 
     @staticmethod
@@ -1907,6 +1931,11 @@ class RoutePlanner:
         trunk_duration = 0.0
         best_trunk = 0.0
         best_trunk_name: str | None = None
+        rapid_bus_weight = 0.0
+        rapid_bus_duration = 0.0
+        best_rapid_bus_route: str | None = None
+        best_rapid_bus_class: str | None = None
+        best_rapid_bus_priority = 0.0
         for leg in transit_legs:
             lm = leg.get("lineMetrics") or {}
             trunk = float(lm.get("trunkScore") or 0.50)
@@ -1917,9 +1946,25 @@ class RoutePlanner:
             if trunk > best_trunk:
                 best_trunk = trunk
                 best_trunk_name = route_name
+            if leg.get("mode") in {"BUS", "TROLLEYBUS"}:
+                priority = float(lm.get("busPriorityScore") or 0)
+                rapid_bus_weight += priority * duration
+                rapid_bus_duration += duration
+                if priority > best_rapid_bus_priority:
+                    best_rapid_bus_priority = priority
+                    best_rapid_bus_route = route_name
+                    best_rapid_bus_class = lm.get("busServiceClass")
         route["avgTrunkScore"] = round(trunk_weight / trunk_duration, 3) if trunk_duration else 0.0
         route["bestTrunkScore"] = round(best_trunk, 3)
         route["bestTrunkRoute"] = best_trunk_name
+        route["avgRapidBusPriority"] = (
+            round(rapid_bus_weight / rapid_bus_duration, 3)
+            if rapid_bus_duration
+            else 0.0
+        )
+        route["bestRapidBusPriority"] = round(best_rapid_bus_priority, 3)
+        route["bestRapidBusRoute"] = best_rapid_bus_route
+        route["bestRapidBusClass"] = best_rapid_bus_class
         return route
 
     def _score_route(self, route: dict[str, Any], profile_key: str) -> dict[str, Any]:
@@ -1940,6 +1985,13 @@ class RoutePlanner:
             if leg.get("transitLeg")
         )
         trunk_bonus = min(260.0, max(0.0, avg_trunk - 0.55) * transit_seconds * 0.45)
+        rapid_bus_seconds = sum(
+            int(leg.get("duration") or 0)
+            for leg in route.get("legs") or []
+            if leg.get("transitLeg") and leg.get("mode") in {"BUS", "TROLLEYBUS"}
+        )
+        rapid_bus_priority = float(route.get("avgRapidBusPriority") or 0)
+        rapid_bus_bonus = min(360.0, rapid_bus_priority * rapid_bus_seconds * 0.22)
 
         discomfort = max(
             0.0,
@@ -1949,7 +2001,8 @@ class RoutePlanner:
             + walk_cost
             + micro_penalty
             + complexity_cost
-            - trunk_bonus,
+            - trunk_bonus
+            - rapid_bus_bonus,
         )
         score = float(route.get("doorToDoor") or 0) + discomfort
 
@@ -1958,6 +2011,7 @@ class RoutePlanner:
         route["complexityCost"] = round(complexity_cost)
         route["transitLegUtilities"] = leg_utilities
         route["trunkBonus"] = round(trunk_bonus)
+        route["rapidBusBonus"] = round(rapid_bus_bonus)
         route["baseScore"] = round(score)
         route["score"] = round(score)
         route["transitModes"] = transit_modes(route)
@@ -2202,6 +2256,19 @@ class RoutePlanner:
             ):
                 archetypes.append("TRANSIT_HEAVY")
             if kind == "mixed" and (
+                transit_share >= 0.80
+                or (
+                    strategy == "public_transport"
+                    and float(route.get("bikeDistance") or 0) <= 300
+                )
+            ):
+                archetypes.append("PUBLIC_TRANSPORT")
+            if (
+                kind == "mixed"
+                and float(route.get("bestRapidBusPriority") or 0) >= 0.72
+            ):
+                archetypes.append("RAPID_BUS")
+            if kind == "mixed" and (
                 bike_share >= 0.52 or route is best_bike_heavy
             ):
                 archetypes.append("BIKE_HEAVY")
@@ -2230,6 +2297,8 @@ class RoutePlanner:
                     "DIRECT_BIKE",
                     "BIKE_HEAVY",
                     "TRUNK_ACCESS",
+                    "RAPID_BUS",
+                    "PUBLIC_TRANSPORT",
                     "RAIL",
                     "EARLY_EGRESS",
                     "TRANSIT_HEAVY",
@@ -2244,6 +2313,8 @@ class RoutePlanner:
                     "BIKE_QUIET",
                     "DIRECT_BIKE",
                     "TRUNK_ACCESS",
+                    "RAPID_BUS",
+                    "PUBLIC_TRANSPORT",
                     "RAIL",
                     "EARLY_EGRESS",
                     "TRANSIT_HEAVY",
@@ -2433,7 +2504,7 @@ class RoutePlanner:
 
         if not kept:
             kept = sorted(routes, key=self._stable_route_key)[:12]
-        kept = sorted(kept, key=self._stable_route_key)[:40]
+        kept = sorted(kept, key=self._stable_route_key)[:60]
         if diagnostics:
             diagnostics.pareto_after = len(kept)
         return kept
@@ -2572,6 +2643,8 @@ class RoutePlanner:
             archetype_order = (
                 "FASTEST",
                 "TRANSIT_HEAVY",
+                "PUBLIC_TRANSPORT",
+                "RAPID_BUS",
                 "TRUNK_ACCESS",
                 "RAIL",
                 "LOW_TRANSFER",
@@ -2591,6 +2664,8 @@ class RoutePlanner:
                 "BIKE_DIRECT",
                 "BIKE_QUIET",
                 "TRUNK_ACCESS",
+                "RAPID_BUS",
+                "PUBLIC_TRANSPORT",
                 "RAIL",
                 "EARLY_EGRESS",
                 "BALANCED",
@@ -2601,6 +2676,8 @@ class RoutePlanner:
                 "FASTEST",
                 "BALANCED",
                 "TRUNK_ACCESS",
+                "RAPID_BUS",
+                "PUBLIC_TRANSPORT",
                 "RAIL",
                 "LOW_TRANSFER",
                 "EARLY_EGRESS",
@@ -2611,7 +2688,13 @@ class RoutePlanner:
                 "BIKE_DIRECT",
                 "BIKE_QUIET",
             )
-        mandatory = {"DIRECT_BIKE", "BIKE_DIRECT", "BIKE_CYCLEWAY"}
+        mandatory = {
+            "DIRECT_BIKE",
+            "BIKE_DIRECT",
+            "BIKE_CYCLEWAY",
+            "PUBLIC_TRANSPORT",
+            "RAPID_BUS",
+        }
         if route_focus <= -1:
             mandatory.update({"TRANSIT_HEAVY", "TRUNK_ACCESS", "RAIL"})
         elif route_focus >= 1:
@@ -2810,6 +2893,10 @@ class RoutePlanner:
                 label = "Оптимальный баланс"
             elif "TRUNK_ACCESS" in (route.get("archetypes") or []):
                 label = "Велосипед к сильной линии"
+            elif "RAPID_BUS" in (route.get("archetypes") or []):
+                label = "Магистральный / экспресс-автобус"
+            elif "PUBLIC_TRANSPORT" in (route.get("archetypes") or []):
+                label = "Максимум общественного транспорта"
             elif route.get("strategy") == "egress_anchor":
                 label = "Ранний выход → велосипед"
             elif route is min_transfers and route.get("kind") == "mixed":
@@ -2869,6 +2956,17 @@ class RoutePlanner:
 
             if float(route.get("bestTrunkScore") or 0) >= 0.68 and route.get("bestTrunkRoute"):
                 notes.append(f"Используется сильная линия {route['bestTrunkRoute']}")
+            rapid_class = route.get("bestRapidBusClass")
+            rapid_route = route.get("bestRapidBusRoute")
+            if rapid_class in {"express", "trunk", "rapid"} and rapid_route:
+                kind = {
+                    "express": "экспресс",
+                    "trunk": "магистральный маршрут",
+                    "rapid": "быстрый автобус",
+                }[rapid_class]
+                notes.append(f"{rapid_route} — {kind}")
+            if "PUBLIC_TRANSPORT" in (route.get("archetypes") or []):
+                notes.append("Почти весь путь проходит на общественном транспорте")
             if route.get("kind") == "mixed" and int(route.get("transitTransfers") or 0) == 0:
                 notes.append("Без пересадок между маршрутами ОТ")
             route["explanations"] = notes[:3]

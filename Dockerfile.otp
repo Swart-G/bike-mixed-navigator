@@ -1,0 +1,22 @@
+FROM docker.io/opentripplanner/opentripplanner:2.9.0_2026-03-13T14-37 AS graph-builder
+
+WORKDIR /var/opentripplanner
+
+COPY otp-config.json ./otp-config.json
+COPY data/moscow.osm.pbf ./moscow.osm.pbf
+COPY data/moscow-gtfs.zip ./moscow-gtfs.zip
+
+# Build the graph during image creation. Compose disables the build cache for
+# this image, so `docker compose up -d --build` always executes this step.
+RUN JAVA_OPTS="-Xmx12g" /docker-entrypoint.sh --build --save \
+    && test -s /var/opentripplanner/graph.obj
+
+
+FROM docker.io/opentripplanner/opentripplanner:2.9.0_2026-03-13T14-37
+
+WORKDIR /var/opentripplanner
+
+COPY otp-config.json ./otp-config.json
+COPY --from=graph-builder /var/opentripplanner/graph.obj ./graph.obj
+
+CMD ["--load", "--serve"]

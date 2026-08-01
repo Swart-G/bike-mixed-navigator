@@ -287,6 +287,16 @@ Similarity clustering сравнивает транспортную цепочк
 карточек. Лучший вариант каждого действительно отличающегося коридора защищён
 от глобального Pareto dominance.
 
+Отдельно сохраняются крайние стратегии: прямые маршруты полностью на велосипеде
+и исходные transit-first маршруты без обязательной замены подходов велосипедом.
+Поэтому в выдаче могут одновременно присутствовать полностью велосипедный вариант
+и вариант, почти целиком состоящий из общественного транспорта.
+
+Для автобусов учитываются не только время и частота, но и класс линии. Маршруты с
+московскими префиксами `м/m` и `е/e`, а также явно быстрые автобусные линии получают
+дополнительный приоритет как магистральные или экспрессные. Финальный лимит выдачи —
+до 20 непохожих маршрутов.
+
 Слева отображается короткое резюме каждого маршрута. Подробности выбранного
 варианта находятся в плавающей карточке над картой; кнопки «назад» и «вперёд»
 переключают участки и приближают их геометрию.
@@ -452,9 +462,10 @@ mixed-navigator-web/
 ```text
 otp-moscow/
 ├── compose.yaml
+├── Dockerfile.otp
+├── otp-config.json
 │
 ├── data/
-│   ├── graph.obj
 │   ├── moscow.osm.pbf
 │   └── moscow-gtfs.zip
 │
@@ -476,7 +487,11 @@ otp-moscow/
 ```yaml
 services:
   otp:
-    image: docker.io/opentripplanner/opentripplanner:2.9.0_2026-03-13T14-37
+    image: bike-mixed-navigator-otp:local
+    build:
+      context: .
+      dockerfile: Dockerfile.otp
+      no_cache: true
     container_name: otp-moscow
 
     ports:
@@ -485,12 +500,19 @@ services:
     environment:
       JAVA_TOOL_OPTIONS: "-Xmx8g"
 
-    volumes:
-      - ./data:/var/opentripplanner:Z
-
-    command:
-      - --load
-      - --serve
+    healthcheck:
+      test:
+        - CMD
+        - /usr/bin/bash
+        - -ec
+        - >-
+          exec 3<>/dev/tcp/127.0.0.1/8080;
+          printf 'GET /otp/actuators/health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n' >&3;
+          head -n 1 <&3 | grep -qE '^HTTP/[0-9.]+ 200 '
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10m
 
     restart: unless-stopped
 
@@ -512,52 +534,53 @@ services:
       - ./data:/otp-data:ro
 
     depends_on:
-      - otp
+      otp:
+        condition: service_healthy
 
     restart: unless-stopped
 ```
 
 ---
 
-# Построение OTP graph
+# OTP readiness
 
-Граф желательно строить отдельно от обычного запуска сервера.
+Actuator API, который используется Docker healthcheck, включается в
+`otp-config.json`:
 
-Пример временного build-сервиса:
-
-```yaml
-otp-build:
-  image: docker.io/opentripplanner/opentripplanner:2.9.0_2026-03-13T14-37
-
-  environment:
-    JAVA_TOOL_OPTIONS: "-Xmx12g"
-
-  volumes:
-    - ./data:/var/opentripplanner:Z
-
-  command:
-    - --build
-    - --save
-
-  profiles:
-    - build
+```json
+{
+  "otpFeatures": {
+    "ActuatorAPI": true
+  }
+}
 ```
 
-Сборка:
-
-```bash
-docker compose --profile build run --rm otp-build
-```
-
-После завершения должен появиться:
-
-```text
-data/graph.obj
-```
+Endpoint `/otp/actuators/health` начинает отвечать `200` только после загрузки
+графа и готовности updaters. До этого web-контейнер не запускается, а
+`POST /api/routes` при недоступности OTP возвращает `503` с кодом
+`OTP_UNAVAILABLE`.
 
 ---
 
-# Запуск
+# Построение OTP graph
+
+`graph.obj` строится в отдельном этапе `Dockerfile.otp` из
+`data/moscow.osm.pbf` и `data/moscow-gtfs.zip`, а затем копируется в финальный
+образ OTP. В `docker-compose.yaml` для этого образа включён `no_cache: true`,
+поэтому обычный полный запуск каждый раз пересобирает граф с нуля:
+
+```bash
+docker compose up -d --build
+```
+
+Старый `data/graph.obj`, если он остался от предыдущей схемы запуска, не
+используется и не монтируется в контейнер. Сервис `otp` стартует только из нового
+образа после успешного завершения build-этапа, а `web` по-прежнему ждёт healthy
+статуса OTP.
+
+---
+
+# Полный запуск и пересборка
 
 ```bash
 docker compose up -d --build

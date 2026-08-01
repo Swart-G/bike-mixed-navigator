@@ -1,20 +1,31 @@
 services:
   otp:
-    image: docker.io/opentripplanner/opentripplanner:2.9.0_2026-03-13T14-37
+    image: bike-mixed-navigator-otp:local
+    build:
+      context: .
+      dockerfile: Dockerfile.otp
+      no_cache: true
     container_name: otp-moscow
 
     ports:
       - "8080:8080"
 
     environment:
-      JAVA_TOOL_OPTIONS: "-Xmx12g"
+      JAVA_TOOL_OPTIONS: "-Xmx8g"
 
-    volumes:
-      - ./data:/var/opentripplanner:Z
-
-    command:
-      - --build
-      - --serve
+    healthcheck:
+      test:
+        - CMD
+        - /usr/bin/bash
+        - -ec
+        - >-
+          exec 3<>/dev/tcp/127.0.0.1/8080;
+          printf 'GET /otp/actuators/health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n' >&3;
+          head -n 1 <&3 | grep -qE '^HTTP/[0-9.]+ 200 '
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10m
 
     restart: unless-stopped
 
@@ -35,6 +46,7 @@ services:
       - ./data:/otp-data:ro
 
     depends_on:
-      - otp
+      otp:
+        condition: service_healthy
 
     restart: unless-stopped

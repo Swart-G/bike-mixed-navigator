@@ -223,7 +223,7 @@ ROUTE_FOCUS_CONFIG: dict[int, RouteFocusConfig] = {
         transit_departure_offsets_min=(0, 8, 16),
         transit_transfer_caps=(4, 2, 1, 0),
         optimizer_focus_variants=(-2, -1, 0, 1, 2),
-        minimum_result_strategies=10,
+        minimum_result_strategies=12,
     ),
     1: RouteFocusConfig(
         key="bike_lean",

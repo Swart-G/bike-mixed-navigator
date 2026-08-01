@@ -1,0 +1,6 @@
+**
+!Dockerfile.otp
+!otp-config.json
+!data/
+!data/moscow.osm.pbf
+!data/moscow-gtfs.zip

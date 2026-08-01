@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import io
 import math
+import re
 import statistics
 import threading
 import zipfile
@@ -32,6 +33,9 @@ class LineMetrics:
     commercial_speed_kmh: float | None
     bikes_allowed_ratio: float | None
     trunk_score: float
+    route_name: str | None = None
+    bus_service_class: str | None = None
+    bus_priority_score: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -71,6 +75,23 @@ class GtfsIndex:
     planner: which stops are useful anchors, and which lines look like strong
     transit backbones rather than slow local micro-legs.
     """
+
+    @staticmethod
+    def _bus_service_class(route_name: str, speed_kmh: float | None) -> tuple[str | None, float]:
+        """Recognise Moscow's named rapid surface routes and fast bus lines.
+
+        The Moscow network uses both Cyrillic and Latin ``м/m`` and ``е/e``
+        prefixes in different feeds.  Commercial speed remains a useful
+        fallback when a feed does not carry that naming convention.
+        """
+        compact = re.sub(r"[\s\-–—]", "", (route_name or "").casefold())
+        if re.match(r"^(?:е|e)\d", compact) or "экспресс" in compact or "express" in compact:
+            return "express", 1.0
+        if re.match(r"^(?:м|m)\d", compact) or "магистрал" in compact:
+            return "trunk", 0.88
+        if speed_kmh is not None and speed_kmh >= 24.0:
+            return "rapid", min(0.78, 0.58 + (speed_kmh - 24.0) / 35.0)
+        return None, 0.0
 
     def __init__(self, path: str) -> None:
         self.path = path
@@ -260,6 +281,7 @@ class GtfsIndex:
         line_metrics: dict[str, LineMetrics] = {}
         for route_id, route in routes.items():
             mode = route["mode"]
+            route_name = route["name"]
             starts_by_service = route_service_starts.get(route_id, {})
             headway_samples: list[int] = []
             for starts in starts_by_service.values():
@@ -279,6 +301,11 @@ class GtfsIndex:
             bike_values = route_bike_allowed.get(route_id) or []
             bikes_ratio = sum(bike_values) / len(bike_values) if bike_values else None
             trip_count = int(route_trip_count.get(route_id, 0))
+            bus_service_class, bus_priority = (
+                self._bus_service_class(route_name, commercial_speed)
+                if mode in {"BUS", "TROLLEYBUS"}
+                else (None, 0.0)
+            )
 
             freq_score = (
                 _clamp(1.0 - median_headway / 900.0, 0.0, 1.0)
@@ -297,14 +324,27 @@ class GtfsIndex:
                 "TROLLEYBUS": 0.56,
                 "BUS": 0.50,
             }.get(mode, 0.35)
-            trunk_score = _clamp(
-                0.35 * freq_score
-                + 0.25 * speed_score
-                + 0.20 * density_score
-                + 0.20 * mode_bonus,
-                0.0,
-                1.0,
-            )
+            if mode in {"BUS", "TROLLEYBUS"}:
+                mode_bonus = max(mode_bonus, 0.48 + 0.48 * bus_priority)
+            if mode in {"BUS", "TROLLEYBUS"}:
+                trunk_score = _clamp(
+                    0.31 * freq_score
+                    + 0.25 * speed_score
+                    + 0.18 * density_score
+                    + 0.14 * mode_bonus
+                    + 0.12 * bus_priority,
+                    0.0,
+                    1.0,
+                )
+            else:
+                trunk_score = _clamp(
+                    0.35 * freq_score
+                    + 0.25 * speed_score
+                    + 0.20 * density_score
+                    + 0.20 * mode_bonus,
+                    0.0,
+                    1.0,
+                )
 
             line_metrics[route_id] = LineMetrics(
                 route_id=route_id,
@@ -314,6 +354,9 @@ class GtfsIndex:
                 commercial_speed_kmh=commercial_speed,
                 bikes_allowed_ratio=bikes_ratio,
                 trunk_score=trunk_score,
+                route_name=route_name,
+                bus_service_class=bus_service_class,
+                bus_priority_score=bus_priority,
             )
 
         stop_infos: list[StopInfo] = []
